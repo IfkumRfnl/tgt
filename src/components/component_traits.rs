@@ -99,8 +99,17 @@ pub trait Component: HandleFocus {
     ///
     /// # Returns
     ///
-    /// * `Result<()>` - An Ok result or an error.
-    fn draw(&mut self, f: &mut ratatui::Frame<'_>, area: layout::Rect) -> io::Result<()>;
+    /// The semantic rectangles rendered by this component. Making them part
+    /// of the required draw result keeps region reporting local to each
+    /// implementation and visible at every callsite. A rectangle touching the
+    /// frame's left edge must begin with a visible neutral host cell (normally
+    /// its border or padding) because VTE discards a zero-width control emitted
+    /// before column zero.
+    fn draw(
+        &mut self,
+        f: &mut ratatui::Frame<'_>,
+        area: layout::Rect,
+    ) -> io::Result<Vec<layout::Rect>>;
     /// Create a new boxed instance of the component.
     ///
     /// # Returns

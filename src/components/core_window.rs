@@ -1005,7 +1005,7 @@ impl Component for CoreWindow {
         }
     }
 
-    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> io::Result<()> {
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> io::Result<Vec<Rect>> {
         let core_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -1037,103 +1037,127 @@ impl Component for CoreWindow {
         self.last_focusable_areas
             .insert(ComponentName::Prompt, sub_core_layout[2]);
 
-        self.components
-            .get_mut(&ComponentName::ChatList)
-            .unwrap_or_else(|| panic!("Failed to get component: {}", ComponentName::ChatList))
-            .draw(frame, core_layout[0])?;
+        let mut bidi_regions = Vec::new();
 
-        self.components
-            .get_mut(&ComponentName::Chat)
-            .unwrap_or_else(|| panic!("Failed to get component: {}", ComponentName::Chat))
-            .draw(frame, sub_core_layout[0])?;
+        bidi_regions.extend(
+            self.components
+                .get_mut(&ComponentName::ChatList)
+                .unwrap_or_else(|| panic!("Failed to get component: {}", ComponentName::ChatList))
+                .draw(frame, core_layout[0])?,
+        );
+
+        bidi_regions.extend(
+            self.components
+                .get_mut(&ComponentName::Chat)
+                .unwrap_or_else(|| panic!("Failed to get component: {}", ComponentName::Chat))
+                .draw(frame, sub_core_layout[0])?,
+        );
 
         if self.show_reply_message {
-            self.components
-                .get_mut(&ComponentName::ReplyMessage)
-                .unwrap_or_else(|| {
-                    panic!("Failed to get component: {}", ComponentName::ReplyMessage)
-                })
-                .draw(frame, sub_core_layout[1])?;
+            bidi_regions.extend(
+                self.components
+                    .get_mut(&ComponentName::ReplyMessage)
+                    .unwrap_or_else(|| {
+                        panic!("Failed to get component: {}", ComponentName::ReplyMessage)
+                    })
+                    .draw(frame, sub_core_layout[1])?,
+            );
         }
-        self.components
-            .get_mut(&ComponentName::Prompt)
-            .unwrap_or_else(|| panic!("Failed to get component: {}", ComponentName::Prompt))
-            .draw(frame, sub_core_layout[2])?;
-
-        // Draw command guide popup if visible (draws on top of everything)
-        if self.show_command_guide {
+        bidi_regions.extend(
             self.components
-                .get_mut(&ComponentName::CommandGuide)
-                .unwrap_or_else(|| {
-                    panic!("Failed to get component: {}", ComponentName::CommandGuide)
-                })
-                .draw(frame, area)?;
+                .get_mut(&ComponentName::Prompt)
+                .unwrap_or_else(|| panic!("Failed to get component: {}", ComponentName::Prompt))
+                .draw(frame, sub_core_layout[2])?,
+        );
+
+        // Draw visible popups on top and include their actual computed rectangles.
+        if self.show_command_guide {
+            bidi_regions.extend(
+                self.components
+                    .get_mut(&ComponentName::CommandGuide)
+                    .unwrap_or_else(|| {
+                        panic!("Failed to get component: {}", ComponentName::CommandGuide)
+                    })
+                    .draw(frame, area)?,
+            );
         }
 
         if self.show_theme_selector {
-            self.components
-                .get_mut(&ComponentName::ThemeSelector)
-                .unwrap_or_else(|| {
-                    panic!("Failed to get component: {}", ComponentName::ThemeSelector)
-                })
-                .draw(frame, area)?;
+            bidi_regions.extend(
+                self.components
+                    .get_mut(&ComponentName::ThemeSelector)
+                    .unwrap_or_else(|| {
+                        panic!("Failed to get component: {}", ComponentName::ThemeSelector)
+                    })
+                    .draw(frame, area)?,
+            );
         }
 
         if self.show_search_overlay {
-            self.components
-                .get_mut(&ComponentName::SearchOverlay)
-                .unwrap_or_else(|| {
-                    panic!("Failed to get component: {}", ComponentName::SearchOverlay)
-                })
-                .draw(frame, area)?;
+            bidi_regions.extend(
+                self.components
+                    .get_mut(&ComponentName::SearchOverlay)
+                    .unwrap_or_else(|| {
+                        panic!("Failed to get component: {}", ComponentName::SearchOverlay)
+                    })
+                    .draw(frame, area)?,
+            );
         }
 
         if self.show_photo_viewer {
-            self.components
-                .get_mut(&ComponentName::PhotoViewer)
-                .unwrap_or_else(|| {
-                    panic!("Failed to get component: {}", ComponentName::PhotoViewer)
-                })
-                .draw(frame, area)?;
+            bidi_regions.extend(
+                self.components
+                    .get_mut(&ComponentName::PhotoViewer)
+                    .unwrap_or_else(|| {
+                        panic!("Failed to get component: {}", ComponentName::PhotoViewer)
+                    })
+                    .draw(frame, area)?,
+            );
         }
 
         if self.show_file_upload_explorer {
-            self.components
-                .get_mut(&ComponentName::FileUploadExplorer)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Failed to get component: {}",
-                        ComponentName::FileUploadExplorer
-                    )
-                })
-                .draw(frame, area)?;
+            bidi_regions.extend(
+                self.components
+                    .get_mut(&ComponentName::FileUploadExplorer)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to get component: {}",
+                            ComponentName::FileUploadExplorer
+                        )
+                    })
+                    .draw(frame, area)?,
+            );
         }
 
         if self.show_file_download_explorer {
-            self.components
-                .get_mut(&ComponentName::FileDownloadExplorer)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Failed to get component: {}",
-                        ComponentName::FileDownloadExplorer
-                    )
-                })
-                .draw(frame, area)?;
+            bidi_regions.extend(
+                self.components
+                    .get_mut(&ComponentName::FileDownloadExplorer)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to get component: {}",
+                            ComponentName::FileDownloadExplorer
+                        )
+                    })
+                    .draw(frame, area)?,
+            );
         }
 
         if self.show_pinned_messages_popup {
-            self.components
-                .get_mut(&ComponentName::PinnedMessagesPopup)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Failed to get component: {}",
-                        ComponentName::PinnedMessagesPopup
-                    )
-                })
-                .draw(frame, area)?;
+            bidi_regions.extend(
+                self.components
+                    .get_mut(&ComponentName::PinnedMessagesPopup)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to get component: {}",
+                            ComponentName::PinnedMessagesPopup
+                        )
+                    })
+                    .draw(frame, area)?,
+            );
         }
 
-        Ok(())
+        Ok(bidi_regions)
     }
 }
 

@@ -159,30 +159,38 @@ impl Tui {
         )
         .split(area);
 
-        self.components
-            .get_mut(&ComponentName::TitleBar)
-            .unwrap_or_else(|| {
-                tracing::error!("Failed to get component: {}", ComponentName::TitleBar);
-                panic!("Failed to get component: {}", ComponentName::TitleBar)
-            })
-            .draw(frame, main_layout[0])?;
+        let mut bidi_regions = Vec::new();
+        bidi_regions.extend(
+            self.components
+                .get_mut(&ComponentName::TitleBar)
+                .unwrap_or_else(|| {
+                    tracing::error!("Failed to get component: {}", ComponentName::TitleBar);
+                    panic!("Failed to get component: {}", ComponentName::TitleBar)
+                })
+                .draw(frame, main_layout[0])?,
+        );
 
-        self.components
-            .get_mut(&ComponentName::CoreWindow)
-            .unwrap_or_else(|| {
-                tracing::error!("Failed to get component: {}", ComponentName::CoreWindow);
-                panic!("Failed to get component: {}", ComponentName::CoreWindow)
-            })
-            .draw(frame, main_layout[1])?;
+        bidi_regions.extend(
+            self.components
+                .get_mut(&ComponentName::CoreWindow)
+                .unwrap_or_else(|| {
+                    tracing::error!("Failed to get component: {}", ComponentName::CoreWindow);
+                    panic!("Failed to get component: {}", ComponentName::CoreWindow)
+                })
+                .draw(frame, main_layout[1])?,
+        );
 
-        self.components
-            .get_mut(&ComponentName::StatusBar)
-            .unwrap_or_else(|| {
-                tracing::error!("Failed to get component: {}", ComponentName::StatusBar);
-                panic!("Failed to get component: {}", ComponentName::StatusBar)
-            })
-            .draw(frame, main_layout[2])?;
+        bidi_regions.extend(
+            self.components
+                .get_mut(&ComponentName::StatusBar)
+                .unwrap_or_else(|| {
+                    tracing::error!("Failed to get component: {}", ComponentName::StatusBar);
+                    panic!("Failed to get component: {}", ComponentName::StatusBar)
+                })
+                .draw(frame, main_layout[2])?,
+        );
 
+        crate::bidi_isolate::isolate_regions(frame.buffer_mut(), &bidi_regions);
         Ok(())
     }
 }

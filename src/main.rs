@@ -1,6 +1,7 @@
 pub mod action;
 pub mod app_context;
 pub mod app_error;
+pub mod bidi_isolate;
 pub mod bundled_config;
 pub mod cli;
 pub mod cli_commands;

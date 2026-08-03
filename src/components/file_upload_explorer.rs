@@ -195,9 +195,9 @@ impl Component for FileUploadExplorer {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> std::io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> std::io::Result<Vec<Rect>> {
         if !self.visible {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Theme can change while the app runs; title callbacks read fresh styles each paint,
@@ -251,6 +251,6 @@ impl Component for FileUploadExplorer {
             instructions_area,
         );
 
-        Ok(())
+        Ok(vec![popup_area])
     }
 }

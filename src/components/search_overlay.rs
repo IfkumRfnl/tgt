@@ -182,9 +182,9 @@ impl Component for SearchOverlay {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> std::io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> std::io::Result<Vec<Rect>> {
         if !self.visible {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Centered overlay
@@ -248,6 +248,6 @@ impl Component for SearchOverlay {
             .repeat_highlight_symbol(true);
         frame.render_stateful_widget(list, chunks[1], &mut self.list_state);
 
-        Ok(())
+        Ok(vec![overlay_rect])
     }
 }

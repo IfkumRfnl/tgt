@@ -79,7 +79,7 @@ impl Component for TitleBar {
         Ok(())
     }
 
-    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> io::Result<()> {
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> io::Result<Vec<Rect>> {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(0), Constraint::Percentage(100)])
@@ -131,6 +131,6 @@ impl Component for TitleBar {
 
         frame.render_widget(paragraph, chunks[1]);
 
-        Ok(())
+        Ok(vec![chunks[1]])
     }
 }

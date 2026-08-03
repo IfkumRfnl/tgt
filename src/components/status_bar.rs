@@ -118,7 +118,7 @@ impl Component for StatusBar {
         }
     }
 
-    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> std::io::Result<()> {
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> std::io::Result<Vec<Rect>> {
         let selected_chat = self
             .app_context
             .tg_context()
@@ -232,6 +232,6 @@ impl Component for StatusBar {
 
         frame.render_widget(paragraph, area);
 
-        Ok(())
+        Ok(vec![area])
     }
 }

@@ -990,7 +990,7 @@ impl Component for PromptWindow {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<Vec<Rect>> {
         self.update_input(area);
 
         let collapsed_top_and_left_border_set = Set {
@@ -1076,7 +1076,7 @@ impl Component for PromptWindow {
                 y: area.y + self.input.cursor_y() as u16 + 1,
             });
         }
-        Ok(())
+        Ok(vec![area])
     }
 }
 

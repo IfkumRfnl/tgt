@@ -286,9 +286,9 @@ impl Component for CommandGuide {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<Vec<Rect>> {
         if !self.visible {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Calculate popup size (80% of screen, centered)
@@ -337,7 +337,7 @@ impl Component for CommandGuide {
 
         frame.render_widget(paragraph, inner_area);
 
-        Ok(())
+        Ok(vec![popup_area])
     }
 }
 

@@ -503,7 +503,7 @@ impl Component for ChatWindow {
         }
     }
 
-    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> std::io::Result<()> {
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> std::io::Result<Vec<Rect>> {
         // Capture selection by ID before any clear, so we can restore viewport on redraw (e.g. when unfocused)
         let selected_message_id_before = self
             .message_list_state
@@ -775,7 +775,7 @@ impl Component for ChatWindow {
         self.message_list_state
             .select(list_sel.map(|i| item_count.saturating_sub(1).saturating_sub(i)));
 
-        Ok(())
+        Ok(vec![area])
     }
 }
 

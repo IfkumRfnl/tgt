@@ -6,6 +6,7 @@ use {
             DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
             Event as CrosstermEvent, EventStream, KeyEventKind,
         },
+        style::Print,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen},
     },
     futures::{future::Fuse, stream::Next, FutureExt, StreamExt},
@@ -20,6 +21,28 @@ use {
         task::JoinHandle,
     },
 };
+
+// VTE-compatible BiDi modes. Implicit mode keeps ordering and Arabic/Persian
+// shaping in VTE, while a fixed LTR paragraph direction preserves the app's
+// layout direction. Final-buffer LRI/PDI isolates (`bidi_isolate`) prevent
+// adjacent RTL runs from absorbing neutral borders and spaces between regions.
+const ENTER_TUI_BIDI_MODE: &str = "\x1b[?2500s\x1b[?2501s\x1b[8h\x1b[1 k\x1b[?2500l\x1b[?2501l";
+// VTE has no save/restore slot for ANSI BDSM or SCP. On exit, restore their
+// documented VTE defaults (implicit BiDi and default/LTR character path);
+// private modes 2500/2501 are restored exactly with XTSAVE/XTRESTORE.
+const LEAVE_TUI_BIDI_MODE: &str = "\x1b[?2500r\x1b[?2501r\x1b[0 k\x1b[8h";
+fn enter_alternate_screen<W: io::Write>(writer: &mut W) -> io::Result<()> {
+    crossterm::execute!(writer, EnterAlternateScreen, Print(ENTER_TUI_BIDI_MODE))
+}
+
+fn leave_alternate_screen<W: io::Write>(writer: &mut W) -> io::Result<()> {
+    crossterm::execute!(
+        writer,
+        Print(LEAVE_TUI_BIDI_MODE),
+        LeaveAlternateScreen,
+        cursor::Show
+    )
+}
 
 /// `TuiBackend` is a struct that represents the backend for the user interface.
 /// It is responsible for managing the terminal and buffering events for
@@ -83,14 +106,12 @@ impl TuiBackend {
             Ok(_) => tracing::info!("Raw mode enabled"),
             Err(e) => tracing::error!("Error enabling raw mode: {}", e),
         }
-        match crossterm::execute!(
-            std::io::stderr(),
-            EnterAlternateScreen,
-            // cursor::Hide
-        ) {
+        match enter_alternate_screen(&mut std::io::stderr()) {
             Ok(_) => tracing::info!("Alternate screen enabled"),
             Err(e) => tracing::error!("Error enabling alternate screen: {}", e),
         };
+        // ED propagates the selected BiDi modes to every alternate-screen line.
+        self.terminal.clear()?;
         if self.mouse {
             crossterm::execute!(std::io::stderr(), EnableMouseCapture)?;
         }
@@ -115,7 +136,7 @@ impl TuiBackend {
     pub fn force_exit(mouse: bool, paste: bool) -> Result<(), std::io::Error> {
         crossterm::terminal::disable_raw_mode()?;
         tracing::info!("Raw mode disabled");
-        crossterm::execute!(std::io::stderr(), LeaveAlternateScreen, cursor::Show)?;
+        leave_alternate_screen(&mut std::io::stderr())?;
         tracing::info!("Alternate screen disabled");
         if mouse {
             crossterm::execute!(std::io::stderr(), DisableMouseCapture)?;
@@ -281,5 +302,31 @@ impl TuiBackend {
             }
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alternate_screen_commands_bracket_tui_with_bidi_modes() {
+        let mut output = Vec::new();
+        enter_alternate_screen(&mut output).unwrap();
+        assert_eq!(
+            output,
+            [b"\x1b[?1049h".as_slice(), ENTER_TUI_BIDI_MODE.as_bytes()].concat()
+        );
+
+        output.clear();
+        leave_alternate_screen(&mut output).unwrap();
+        assert_eq!(
+            output,
+            [
+                LEAVE_TUI_BIDI_MODE.as_bytes(),
+                b"\x1b[?1049l\x1b[?25h".as_slice()
+            ]
+            .concat()
+        );
     }
 }

@@ -212,9 +212,9 @@ impl Component for ThemeSelector {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<Vec<Rect>> {
         if !self.visible {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Calculate popup size (60% width, 50% height, centered)
@@ -297,6 +297,6 @@ impl Component for ThemeSelector {
             ratatui::widgets::Paragraph::new(instructions).style(self.app_context.style_chat());
         frame.render_widget(instructions_paragraph, instructions_area);
 
-        Ok(())
+        Ok(vec![popup_area])
     }
 }

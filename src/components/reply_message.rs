@@ -75,7 +75,7 @@ impl Component for ReplyMessage {
         Ok(())
     }
 
-    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> io::Result<()> {
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> io::Result<Vec<Rect>> {
         let mut text = Text::default();
         text.extend(vec![Line::from(vec![Span::styled(
             (*self.app_context.tg_context().reply_message_text()).to_string(),
@@ -105,6 +105,6 @@ impl Component for ReplyMessage {
 
         frame.render_widget(paragraph, area);
 
-        Ok(())
+        Ok(vec![area])
     }
 }

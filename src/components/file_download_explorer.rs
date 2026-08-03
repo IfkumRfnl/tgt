@@ -353,9 +353,9 @@ impl Component for FileDownloadExplorer {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> std::io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> std::io::Result<Vec<Rect>> {
         if !self.visible {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         self.explorer
@@ -508,6 +508,6 @@ impl Component for FileDownloadExplorer {
             footer,
         );
 
-        Ok(())
+        Ok(vec![popup_area])
     }
 }

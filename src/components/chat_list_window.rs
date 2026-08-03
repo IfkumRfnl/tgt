@@ -615,7 +615,7 @@ impl Component for ChatListWindow {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> std::io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> std::io::Result<Vec<Rect>> {
         let style_border_focused = if self.focused {
             self.app_context.style_border_component_focused()
         } else {
@@ -684,7 +684,7 @@ impl Component for ChatListWindow {
         frame.render_stateful_widget(list, list_area, &mut self.chat_list_state);
         // Store first visible item index for click-to-item (List updates state.offset on render).
         self.last_list_offset = Some(self.chat_list_state.offset());
-        Ok(())
+        Ok(vec![area])
     }
 }
 

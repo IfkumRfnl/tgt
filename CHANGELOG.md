@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 - Upgraded **tdlib-rs** to v1.4.0 (new `static` feature, `ureq` replaces `reqwest`, Android support, `#[link]` attribute removed from tdjson FFI).
 - UI render-on-demand to reduce idle CPU while keeping Telegram-driven updates responsive.
+- Component rendering reports semantic rectangles through its draw contract, making final-buffer BiDi isolation compositional instead of mutable global state.
 - Focus tracking uses atomics instead of a mutex for lock-free reads/writes.
 - Hardcoded keys moved into `keymap.toml`; keymaps merge defaults with user config and load dynamically (including photo viewer hints).
 - Chat message list uses bottom-anchored layout to avoid large gaps; reply target highlighting; reply/edit rules (e.g. no editing others’ messages).
@@ -34,6 +35,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Fixed
 
+- RTL text in VTE terminals is isolated per rendered TUI region with LRI/PDI, preventing adjacent panes and popups from exchanging sides while preserving Arabic and Persian shaping.
 - Stack overflow in the prompt when wrapping at the window edge (`insert_newline` no longer recurses through `insert('\n')`).
 - Occasional startup hangs and chat list refresh hangs.
 - Chat search reliability and clearer failure feedback via the status bar.

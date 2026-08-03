@@ -130,9 +130,9 @@ impl Component for PinnedMessagesPopup {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<Vec<Rect>> {
         if !self.visible || self.messages.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let popup_width = (area.width as f32 * 0.85).max(20.0).min(area.width as f32) as u16;
@@ -220,6 +220,6 @@ impl Component for PinnedMessagesPopup {
             footer_area,
         );
 
-        Ok(())
+        Ok(vec![popup_area])
     }
 }
