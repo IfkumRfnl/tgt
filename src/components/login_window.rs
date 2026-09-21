@@ -303,6 +303,9 @@ impl LoginWindow {
     }
 
     fn submit_field(&mut self) -> Option<Action> {
+        if let LoginForm::Registration { .. } = self.form {
+            return self.submit_registration();
+        }
         let action = match &self.form {
             LoginForm::Phone { text } => {
                 let phone = normalize_phone(text);
@@ -348,35 +351,44 @@ impl LoginWindow {
                 }
                 Action::LoginSubmitEmailCode(code)
             }
-            LoginForm::Registration { .. } => {
-                let (first, last, field) = match &self.form {
-                    LoginForm::Registration { first, last, field } => {
-                        (first.clone(), last.clone(), *field)
-                    }
-                    _ => return None,
-                };
-                if field == NameField::First {
-                    if let LoginForm::Registration { field, .. } = &mut self.form {
-                        *field = NameField::Last;
-                    }
-                    self.app_context.mark_dirty();
-                    return None;
-                }
-                let first = first.trim().to_string();
-                let last = last.trim().to_string();
-                if first.is_empty() {
-                    self.error = Some("First name is required.".into());
-                    self.app_context.mark_dirty();
-                    return None;
-                }
-                Action::LoginSubmitRegistration { first, last }
-            }
-            LoginForm::Menu { .. } => return None,
+            LoginForm::Menu { .. } | LoginForm::Registration { .. } => return None,
         };
         self.busy = true;
         self.error = None;
         self.app_context.mark_dirty();
         Some(action)
+    }
+
+    /// Enter on the first name moves to the last name. Enter there submits both.
+    fn submit_registration(&mut self) -> Option<Action> {
+        let on_first_name = matches!(
+            self.form,
+            LoginForm::Registration {
+                field: NameField::First,
+                ..
+            }
+        );
+        if on_first_name {
+            if let LoginForm::Registration { field, .. } = &mut self.form {
+                *field = NameField::Last;
+            }
+            self.app_context.mark_dirty();
+            return None;
+        }
+        let LoginForm::Registration { first, last, .. } = &self.form else {
+            return None;
+        };
+        let first = first.trim().to_string();
+        let last = last.trim().to_string();
+        if first.is_empty() {
+            self.error = Some("First name is required.".into());
+            self.app_context.mark_dirty();
+            return None;
+        }
+        self.busy = true;
+        self.error = None;
+        self.app_context.mark_dirty();
+        Some(Action::LoginSubmitRegistration { first, last })
     }
 
     fn draw_card(&self, frame: &mut ratatui::Frame<'_>, area: Rect, lines: Vec<Line>, width: u16) {
