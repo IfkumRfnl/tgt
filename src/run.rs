@@ -42,12 +42,7 @@ pub async fn run_app(
         return run_cli_session(app_context, tg_backend).await;
     }
 
-    tui_backend.enter()?;
-    tui.register_action_handler(app_context.action_tx().clone())?;
-    app_context.set_focused_component(Some(ComponentName::Login));
-    app_context.mark_dirty();
-
-    // Voice wake: playback thread signals so status bar position updates immediately.
+    // Open audio before the alternate screen so ALSA probe text stays off the card.
     let (voice_wake_tx, mut voice_wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     #[cfg(feature = "rodio")]
     {
@@ -58,6 +53,11 @@ pub async fn run_app(
     }
     #[cfg(not(feature = "rodio"))]
     let _voice_wake_tx = voice_wake_tx;
+
+    tui_backend.enter()?;
+    tui.register_action_handler(app_context.action_tx().clone())?;
+    app_context.set_focused_component(Some(ComponentName::Login));
+    app_context.mark_dirty();
 
     // Refresh task: ~60 FPS. We no longer block on TUI/TG in the select, so this won't spin; wake + drain keeps UI responsive.
     const REFRESH_MS: u64 = 16; // 1000/60 ≈ 60 FPS

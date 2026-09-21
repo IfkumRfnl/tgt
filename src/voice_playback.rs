@@ -35,17 +35,23 @@ pub fn spawn_playback_thread(
 ) -> Option<std::sync::mpsc::Sender<VoicePlaybackCommand>> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
 
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let sink_handle = match rodio::DeviceSinkBuilder::open_default_sink() {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!("Failed to open default audio stream: {:?}", e);
                 let _ = action_tx.send(Action::StatusMessage("Voice: no audio device".to_string()));
+                let _ = ready_tx.send(());
                 return;
             }
         };
+        let _ = ready_tx.send(());
         run_playback_loop(cmd_rx, sink_handle, action_tx, wake_tx);
     });
+    // ALSA writes device-probe warnings to stderr. Wait until that probe
+    // finishes so it does not land on the alternate screen.
+    let _ = ready_rx.recv_timeout(Duration::from_secs(2));
 
     Some(cmd_tx)
 }
