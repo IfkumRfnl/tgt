@@ -1006,60 +1006,15 @@ pub async fn handle_app_actions(
                     state.is_playing = false;
                 }
             }
-            Action::LoginSelectQr => {
-                if let Err(error) = tg_backend.request_qr_login().await {
-                    tracing::error!("QR login request failed: {}", error.message);
-                    let _ = app_context
-                        .action_tx()
-                        .send(Action::LoginFailed(error.message));
-                }
-            }
-            Action::LoginSubmitPhone(phone) => {
-                if let Err(error) = tg_backend.submit_phone(phone.clone()).await {
-                    tracing::error!("Phone submit failed: {}", error.message);
-                    let _ = app_context
-                        .action_tx()
-                        .send(Action::LoginFailed(error.message));
-                }
-            }
-            Action::LoginSubmitCode(code) => {
-                if let Err(error) = tg_backend.submit_code(code.clone()).await {
-                    tracing::error!("Code submit failed: {}", error.message);
-                    let _ = app_context
-                        .action_tx()
-                        .send(Action::LoginFailed(error.message));
-                }
-            }
-            Action::LoginSubmitPassword(password) => {
-                if let Err(error) = tg_backend.submit_password(password.clone()).await {
-                    tracing::error!("Password submit failed: {}", error.message);
-                    let _ = app_context
-                        .action_tx()
-                        .send(Action::LoginFailed(error.message));
-                }
-            }
-            Action::LoginSubmitEmail(email) => {
-                if let Err(error) = tg_backend.submit_email(email.clone()).await {
-                    tracing::error!("Email submit failed: {}", error.message);
-                    let _ = app_context
-                        .action_tx()
-                        .send(Action::LoginFailed(error.message));
-                }
-            }
-            Action::LoginSubmitEmailCode(code) => {
-                if let Err(error) = tg_backend.submit_email_code(code.clone()).await {
-                    tracing::error!("Email code submit failed: {}", error.message);
-                    let _ = app_context
-                        .action_tx()
-                        .send(Action::LoginFailed(error.message));
-                }
-            }
-            Action::LoginSubmitRegistration { first, last } => {
-                if let Err(error) = tg_backend
-                    .submit_registration(first.clone(), last.clone())
-                    .await
-                {
-                    tracing::error!("Registration failed: {}", error.message);
+            Action::LoginSelectQr
+            | Action::LoginSubmitPhone(_)
+            | Action::LoginSubmitCode(_)
+            | Action::LoginSubmitPassword(_)
+            | Action::LoginSubmitEmail(_)
+            | Action::LoginSubmitEmailCode(_)
+            | Action::LoginSubmitRegistration { .. } => {
+                if let Err(error) = tg_backend.submit_login(&action).await {
+                    tracing::error!("sign-in request failed: {}", error.message);
                     let _ = app_context
                         .action_tx()
                         .send(Action::LoginFailed(error.message));

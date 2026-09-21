@@ -606,28 +606,21 @@ impl TgBackend {
     /// States that need no typing are handled here. States that need the sign-in
     /// card are returned as [`AppliedAuth::Phase`] and are not prompted on stdin.
     pub async fn apply_auth_update(&mut self, state: AuthorizationState) -> AppliedAuth {
+        if let AuthorizationState::WaitOtherDeviceConfirmation(confirmation) = &state {
+            tracing::info!(link = %confirmation.link, "qr login link");
+        }
+        if matches!(state, AuthorizationState::Ready) {
+            self.have_authorization = true;
+        }
+        if let Some(auth) = TdAuth::from_authorization_state(&state) {
+            return AppliedAuth::Phase(auth);
+        }
         match state {
             AuthorizationState::WaitTdlibParameters => {
                 if let Err(error) = self.apply_tdlib_parameters().await {
                     tracing::error!("Failed to set TDLib parameters: {}", error.message);
                 }
                 AppliedAuth::Unchanged
-            }
-            AuthorizationState::WaitPhoneNumber => AppliedAuth::Phase(TdAuth::WaitPhoneNumber),
-            AuthorizationState::WaitOtherDeviceConfirmation(confirmation) => {
-                tracing::info!(link = %confirmation.link, "qr login link");
-                AppliedAuth::Phase(TdAuth::WaitOtherDevice {
-                    link: confirmation.link,
-                })
-            }
-            AuthorizationState::WaitEmailAddress(_) => AppliedAuth::Phase(TdAuth::WaitEmail),
-            AuthorizationState::WaitEmailCode(_) => AppliedAuth::Phase(TdAuth::WaitEmailCode),
-            AuthorizationState::WaitCode(_) => AppliedAuth::Phase(TdAuth::WaitCode),
-            AuthorizationState::WaitRegistration(_) => AppliedAuth::Phase(TdAuth::WaitRegistration),
-            AuthorizationState::WaitPassword(_) => AppliedAuth::Phase(TdAuth::WaitPassword),
-            AuthorizationState::Ready => {
-                self.have_authorization = true;
-                AppliedAuth::Phase(TdAuth::Ready)
             }
             AuthorizationState::LoggingOut => {
                 self.have_authorization = false;
@@ -648,6 +641,7 @@ impl TgBackend {
                 tracing::info!("Waiting for premium purchase confirmation");
                 AppliedAuth::Unchanged
             }
+            _ => AppliedAuth::Unchanged,
         }
     }
 
@@ -694,62 +688,40 @@ impl TgBackend {
         }
     }
 
-    /// Start QR-code login. The link arrives later as `WaitOtherDevice`.
-    pub async fn request_qr_login(&self) -> Result<(), tdlib_rs::types::Error> {
-        functions::request_qr_code_authentication(Vec::<i64>::new(), self.client_id)
-            .await
-            .map(|_| ())
-    }
-
-    /// Send the phone number from the sign-in card.
-    pub async fn submit_phone(&self, phone_number: String) -> Result<(), tdlib_rs::types::Error> {
-        functions::set_authentication_phone_number(phone_number, None, self.client_id)
-            .await
-            .map(|_| ())
-    }
-
-    /// Send the login code from the sign-in card.
-    pub async fn submit_code(&self, code: String) -> Result<(), tdlib_rs::types::Error> {
-        functions::check_authentication_code(code, self.client_id)
-            .await
-            .map(|_| ())
-    }
-
-    /// Send the cloud password from the sign-in card.
-    pub async fn submit_password(&self, password: String) -> Result<(), tdlib_rs::types::Error> {
-        functions::check_authentication_password(password, self.client_id)
-            .await
-            .map(|_| ())
-    }
-
-    /// Send an email address Telegram asked for.
-    pub async fn submit_email(&self, email_address: String) -> Result<(), tdlib_rs::types::Error> {
-        functions::set_authentication_email_address(email_address, self.client_id)
-            .await
-            .map(|_| ())
-    }
-
-    /// Send the email verification code.
-    pub async fn submit_email_code(&self, code: String) -> Result<(), tdlib_rs::types::Error> {
-        functions::check_authentication_email_code(
-            enums::EmailAddressAuthentication::Code(
-                tdlib_rs::types::EmailAddressAuthenticationCode { code },
-            ),
-            self.client_id,
-        )
-        .await
-        .map(|_| ())
-    }
-
-    /// Register a new account with the names from the sign-in card.
-    pub async fn submit_registration(
-        &self,
-        first_name: String,
-        last_name: String,
-    ) -> Result<(), tdlib_rs::types::Error> {
-        functions::register_user(first_name, last_name, false, self.client_id)
-            .await
-            .map(|_| ())
+    /// Send one sign-in step. The next authorization update moves the card.
+    pub async fn submit_login(&self, action: &Action) -> Result<(), tdlib_rs::types::Error> {
+        let client_id = self.client_id;
+        match action {
+            Action::LoginSelectQr => {
+                functions::request_qr_code_authentication(Vec::new(), client_id).await?;
+            }
+            Action::LoginSubmitPhone(phone) => {
+                functions::set_authentication_phone_number(phone.clone(), None, client_id).await?;
+            }
+            Action::LoginSubmitCode(code) => {
+                functions::check_authentication_code(code.clone(), client_id).await?;
+            }
+            Action::LoginSubmitPassword(password) => {
+                functions::check_authentication_password(password.clone(), client_id).await?;
+            }
+            Action::LoginSubmitEmail(email) => {
+                functions::set_authentication_email_address(email.clone(), client_id).await?;
+            }
+            Action::LoginSubmitEmailCode(code) => {
+                functions::check_authentication_email_code(
+                    enums::EmailAddressAuthentication::Code(
+                        tdlib_rs::types::EmailAddressAuthenticationCode { code: code.clone() },
+                    ),
+                    client_id,
+                )
+                .await?;
+            }
+            Action::LoginSubmitRegistration { first, last } => {
+                functions::register_user(first.clone(), last.clone(), false, client_id).await?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn apply_tdlib_parameters(&self) -> Result<(), tdlib_rs::types::Error> {
