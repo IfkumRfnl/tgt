@@ -30,6 +30,13 @@ enum Input {
     Name,
 }
 
+/// The two rows on the sign-in menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuRow {
+    Qr,
+    Phone,
+}
+
 /// Sign-in card shown before [`TdAuth::Ready`].
 pub struct LoginWindow {
     app_context: Arc<AppContext>,
@@ -39,8 +46,7 @@ pub struct LoginWindow {
     last: String,
     /// Registration cursor is on the last name.
     on_last: bool,
-    /// Menu cursor: 0 is QR, 1 is phone.
-    menu: usize,
+    menu: MenuRow,
     /// `WaitPhoneNumber` is showing the phone field rather than the menu.
     entering_phone: bool,
     error: Option<String>,
@@ -57,7 +63,7 @@ impl LoginWindow {
             text: String::new(),
             last: String::new(),
             on_last: false,
-            menu: 0,
+            menu: MenuRow::Qr,
             entering_phone: false,
             error: None,
             qr_pending: false,
@@ -119,7 +125,7 @@ impl LoginWindow {
         }
         if code == KeyCode::Esc && self.entering_phone {
             self.entering_phone = false;
-            self.menu = 1;
+            self.menu = MenuRow::Phone;
             self.error = None;
             self.app_context.mark_dirty();
             return None;
@@ -136,31 +142,29 @@ impl LoginWindow {
 
     fn on_menu_key(&mut self, code: KeyCode) -> Option<Action> {
         match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.menu = self.menu.saturating_sub(1);
-                self.app_context.mark_dirty();
-                None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.menu = (self.menu + 1).min(1);
-                self.app_context.mark_dirty();
-                None
-            }
-            KeyCode::Enter if self.menu == 0 => {
+            KeyCode::Up => self.menu = MenuRow::Qr,
+            KeyCode::Down => self.menu = MenuRow::Phone,
+            KeyCode::Enter => return self.choose_row(),
+            _ => return None,
+        }
+        self.app_context.mark_dirty();
+        None
+    }
+
+    fn choose_row(&mut self) -> Option<Action> {
+        self.error = None;
+        self.app_context.mark_dirty();
+        match self.menu {
+            MenuRow::Qr => {
                 self.qr_pending = true;
                 self.busy = true;
-                self.error = None;
-                self.app_context.mark_dirty();
                 Some(Action::LoginSelectQr)
             }
-            KeyCode::Enter => {
+            MenuRow::Phone => {
                 self.entering_phone = true;
                 self.text.clear();
-                self.error = None;
-                self.app_context.mark_dirty();
                 None
             }
-            _ => None,
         }
     }
 
@@ -292,11 +296,14 @@ impl LoginWindow {
     }
 
     fn menu_lines(&self) -> Vec<Line<'static>> {
-        let options = ["Log in with a QR code", "Log in with a phone number"];
+        let options = [
+            (MenuRow::Qr, "Log in with a QR code"),
+            (MenuRow::Phone, "Log in with a phone number"),
+        ];
         let mut lines = vec![Line::from("Choose how to sign in"), Line::from("")];
-        for (index, label) in options.iter().enumerate() {
-            let marker = if index == self.menu { ">" } else { " " };
-            let style = if index == self.menu {
+        for (row, label) in options {
+            let marker = if row == self.menu { ">" } else { " " };
+            let style = if row == self.menu {
                 active_style()
             } else {
                 Style::default()
