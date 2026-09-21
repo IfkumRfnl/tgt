@@ -7,7 +7,7 @@ use crate::{
     tg::login_phase::TdAuth,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
-use qrcode::{Color, QrCode};
+use qrcode::{Color as QrColor, EcLevel, QrCode};
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
@@ -380,8 +380,13 @@ impl LoginWindow {
     }
 
     fn draw_card(&self, frame: &mut ratatui::Frame<'_>, area: Rect, lines: Vec<Line>, width: u16) {
-        let body_rows = lines.len() as u16;
         let card_width = width.min(area.width).max(1);
+        let inner = usize::from(card_width.saturating_sub(2).max(1));
+        let body_rows: usize = lines
+            .iter()
+            .map(|line| wrapped_rows(line_cols(line), inner))
+            .sum();
+        let body_rows = u16::try_from(body_rows).unwrap_or(u16::MAX);
         let card_height = body_rows.saturating_add(2).min(area.height).max(1);
         let rect = centered_rect(card_width, card_height, area);
         let block = Block::default()
@@ -483,47 +488,22 @@ impl LoginWindow {
         lines
     }
 
-    fn qr_lines(&self, link: &str, max_body_rows: u16) -> (Vec<Line<'static>>, u16) {
-        let rendered = [2usize, 1, 0].into_iter().find_map(|quiet| {
-            let rows = render_qr_half_blocks_quiet(link, quiet)?;
-            let chrome = 6u16;
-            if rows.len() as u16 + chrome <= max_body_rows || quiet == 0 {
-                Some(rows)
-            } else {
-                None
-            }
-        });
-        let mut lines = vec![
-            Line::from("Scan with Telegram on your phone"),
-            Line::from("Settings → Devices → Link Desktop Device"),
-            Line::from(""),
-        ];
-        let mut width = TEXT_CARD_WIDTH;
-        match rendered {
-            Some(rows) => {
-                let row_width = rows
-                    .first()
-                    .map(|row| UnicodeWidthStr::width(row.as_str()))
-                    .unwrap_or(0);
-                width = (row_width as u16).saturating_add(4).max(TEXT_CARD_WIDTH);
-                for row in rows {
-                    lines.push(Line::from(Span::styled(
-                        format!(" {row}"),
-                        Style::default()
-                            .fg(ratatui::style::Color::Black)
-                            .bg(ratatui::style::Color::White),
-                    )));
-                }
-            }
-            None => {
-                lines.push(Line::from("Could not build a QR code for this link."));
-            }
-        }
-        lines.push(Line::from(""));
-        lines.push(hint("The code refreshes on its own.  q quits"));
-        if lines.len() as u16 + 1 < max_body_rows {
-            lines.push(hint(link));
-        }
+    fn qr_lines(&self, link: &str, area_width: u16, area_height: u16) -> (Vec<Line<'static>>, u16) {
+        let (planned, width) = plan_sign_in_qr(link, area_width, area_height);
+        let mut lines = planned
+            .into_iter()
+            .map(|line| match line {
+                PlannedLine::Text(text) => Line::from(text),
+                PlannedLine::Dim(text) => hint(&text),
+                PlannedLine::Blank => Line::from(""),
+                PlannedLine::Qr(row) => Line::from(Span::styled(
+                    row,
+                    Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(ratatui::style::Color::White),
+                )),
+            })
+            .collect();
         self.push_error(&mut lines);
         (lines, width)
     }
@@ -587,7 +567,7 @@ impl Component for LoginWindow {
                 ],
                 TEXT_CARD_WIDTH,
             ),
-            TdAuth::WaitOtherDevice { link } => self.qr_lines(link, area.height.saturating_sub(2)),
+            TdAuth::WaitOtherDevice { link } => self.qr_lines(link, area.width, area.height),
             TdAuth::WaitPhoneNumber if self.qr_pending => (
                 vec![
                     Line::from("Requesting a QR code…"),
@@ -687,6 +667,190 @@ fn hint(text: &str) -> Line<'static> {
     ))
 }
 
+fn line_cols(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| {
+            let text: &str = span.content.as_ref();
+            UnicodeWidthStr::width(text)
+        })
+        .sum()
+}
+
+fn wrapped_rows(cols: usize, inner: usize) -> usize {
+    if cols == 0 || inner == 0 {
+        1
+    } else {
+        cols.div_ceil(inner).max(1)
+    }
+}
+
+/// One row of the sign-in card, before colors are applied.
+#[derive(Debug, PartialEq, Eq)]
+enum PlannedLine {
+    Text(String),
+    Dim(String),
+    Blank,
+    Qr(String),
+}
+
+/// Largest half-block QR that fits, with the most explanation that still leaves room.
+///
+/// Module size grows when the terminal has space, and the quiet zone shrinks when it
+/// does not. A code that would have to be clipped is omitted.
+fn plan_sign_in_qr(link: &str, area_width: u16, area_height: u16) -> (Vec<PlannedLine>, u16) {
+    let inner_w = usize::from(area_width.saturating_sub(2));
+    let inner_h = usize::from(area_height.saturating_sub(2));
+    let presets: &[(&[&str], &[&str])] = &[
+        (
+            &[
+                "Scan with Telegram on your phone",
+                "Settings → Devices → Link Desktop Device",
+                "",
+            ],
+            &["", "The code refreshes on its own.  q quits"],
+        ),
+        (&["Scan with Telegram", ""], &["", "q quits"]),
+        (&["Scan with Telegram"], &["q quits"]),
+        (&[], &["q quits"]),
+        (&[], &[]),
+    ];
+
+    for (headers, footers) in presets {
+        let chrome = headers.len() + footers.len();
+        if chrome >= inner_h || inner_w < 21 {
+            continue;
+        }
+        let Some(rows) = fit_qr(link, inner_w, inner_h - chrome) else {
+            continue;
+        };
+        let qr_width = UnicodeWidthStr::width(rows[0].as_str());
+        let min_field = usize::from(TEXT_CARD_WIDTH.saturating_sub(2)).min(inner_w);
+        let field = qr_width.max(min_field).min(inner_w);
+        let mut lines = Vec::new();
+        push_copy(&mut lines, headers);
+        let pad = field - qr_width;
+        let left = pad / 2;
+        let right = pad - left;
+        for row in rows {
+            lines.push(PlannedLine::Qr(format!(
+                "{}{row}{}",
+                " ".repeat(left),
+                " ".repeat(right)
+            )));
+        }
+        push_copy(&mut lines, footers);
+        let link_rows = wrapped_rows(UnicodeWidthStr::width(link), field.max(1));
+        if lines.len() + link_rows <= inner_h {
+            lines.push(PlannedLine::Dim(link.to_string()));
+        }
+        let card_width = u16::try_from(field)
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(area_width)
+            .max(1);
+        return (lines, card_width);
+    }
+
+    let width = TEXT_CARD_WIDTH.min(area_width).max(1);
+    (
+        vec![
+            PlannedLine::Text("This window is too small for a QR code.".into()),
+            PlannedLine::Blank,
+            PlannedLine::Text("Make the terminal larger, or open the link".into()),
+            PlannedLine::Text("on a phone that is already signed in.".into()),
+            PlannedLine::Blank,
+            PlannedLine::Dim(link.to_string()),
+            PlannedLine::Blank,
+            PlannedLine::Dim("q quits".into()),
+        ],
+        width,
+    )
+}
+
+fn push_copy(lines: &mut Vec<PlannedLine>, texts: &[&str]) {
+    for text in texts {
+        if text.is_empty() {
+            lines.push(PlannedLine::Blank);
+        } else {
+            lines.push(PlannedLine::Text((*text).to_string()));
+        }
+    }
+}
+
+const QR_SCALE_MAX: usize = 3;
+
+fn fit_qr(data: &str, max_cols: usize, max_rows: usize) -> Option<Vec<String>> {
+    for scale in (1..=QR_SCALE_MAX).rev() {
+        for quiet in [4usize, 2, 1, 0] {
+            for ec in [EcLevel::M, EcLevel::L] {
+                let Some(rows) = render_qr(data, ec, quiet, scale) else {
+                    continue;
+                };
+                let width = UnicodeWidthStr::width(rows[0].as_str());
+                if width <= max_cols
+                    && rows.len() <= max_rows
+                    && rows
+                        .iter()
+                        .all(|row| UnicodeWidthStr::width(row.as_str()) == width)
+                {
+                    return Some(rows);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn render_qr(data: &str, ec: EcLevel, quiet: usize, scale: usize) -> Option<Vec<String>> {
+    if scale == 0 {
+        return None;
+    }
+    let code = QrCode::with_error_correction_level(data.as_bytes(), ec).ok()?;
+    let modules = code.width();
+    let pixels = modules.saturating_add(quiet.saturating_mul(2)) * scale;
+    let mut rows = Vec::with_capacity(pixels.div_ceil(2));
+    let mut y = 0;
+    while y < pixels {
+        let mut line = String::with_capacity(pixels);
+        for x in 0..pixels {
+            let top = module_dark(&code, x, y, modules, quiet, scale);
+            let bottom = if y + 1 < pixels {
+                module_dark(&code, x, y + 1, modules, quiet, scale)
+            } else {
+                false
+            };
+            line.push(match (top, bottom) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        rows.push(line);
+        y += 2;
+    }
+    Some(rows)
+}
+
+fn module_dark(
+    code: &QrCode,
+    x: usize,
+    y: usize,
+    modules: usize,
+    quiet: usize,
+    scale: usize,
+) -> bool {
+    let mx = x / scale;
+    let my = y / scale;
+    if mx < quiet || my < quiet {
+        return false;
+    }
+    let mx = mx - quiet;
+    let my = my - quiet;
+    mx < modules && my < modules && code[(mx, my)] == QrColor::Dark
+}
+
 fn normalize_phone(raw: &str) -> String {
     raw.chars()
         .filter(|ch| ch.is_ascii_digit() || *ch == '+')
@@ -701,53 +865,26 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width, height)
 }
 
-/// Render `data` as Unicode half-block rows, with a 2-module quiet zone.
-pub fn render_qr_half_blocks(data: &str) -> Option<Vec<String>> {
-    render_qr_half_blocks_quiet(data, 2)
-}
-
-fn render_qr_half_blocks_quiet(data: &str, quiet: usize) -> Option<Vec<String>> {
-    let code = QrCode::new(data.as_bytes()).ok()?;
-    let modules = code.width();
-    let size = modules + quiet * 2;
-    let mut dark = vec![vec![false; size]; size];
-    for y in 0..modules {
-        for x in 0..modules {
-            if code[(x, y)] == Color::Dark {
-                dark[y + quiet][x + quiet] = true;
-            }
-        }
-    }
-
-    let mut rows = Vec::new();
-    let mut y = 0;
-    while y < size {
-        let mut line = String::new();
-        for (x, cell) in dark[y].iter().enumerate() {
-            let top = *cell;
-            let bottom = if y + 1 < size { dark[y + 1][x] } else { false };
-            line.push(match (top, bottom) {
-                (true, true) => '█',
-                (true, false) => '▀',
-                (false, true) => '▄',
-                (false, false) => ' ',
-            });
-        }
-        rows.push(line);
-        y += 2;
-    }
-    Some(rows)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{normalize_phone, render_qr_half_blocks};
+    use super::{fit_qr, normalize_phone, plan_sign_in_qr, PlannedLine};
     use unicode_width::UnicodeWidthStr;
 
+    const LOGIN_LINK: &str = "tg://login?token=AQFMZ7FqnLbu6mkE73IL6xwZJc3jB9AK2eHmzKx733wi_g";
+
+    fn qr_rows(lines: &[PlannedLine]) -> Vec<&str> {
+        lines
+            .iter()
+            .filter_map(|line| match line {
+                PlannedLine::Qr(row) => Some(row.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn qr_rows_are_even_blocks() {
-        let rows = render_qr_half_blocks("tg://login?token=abc").expect("qr");
-        assert!(rows.len() >= 10);
+    fn qr_rows_share_one_width() {
+        let rows = fit_qr(LOGIN_LINK, 80, 40).expect("qr");
         let width = UnicodeWidthStr::width(rows[0].as_str());
         assert!(width > 20);
         assert!(rows
@@ -756,6 +893,37 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.contains('█') || row.contains('▀') || row.contains('▄')));
+    }
+
+    #[test]
+    fn qr_fits_a_classic_terminal() {
+        let (lines, card_width) = plan_sign_in_qr(LOGIN_LINK, 80, 24);
+        let rows = qr_rows(&lines);
+        assert!(!rows.is_empty());
+        assert!(card_width <= 80);
+        assert!(lines.len() + 2 <= 24);
+        let width = UnicodeWidthStr::width(rows[0]);
+        assert!(rows.iter().all(|row| UnicodeWidthStr::width(*row) == width));
+        assert!(width + 2 <= 80);
+    }
+
+    #[test]
+    fn qr_grows_when_the_terminal_is_larger() {
+        let small = fit_qr(LOGIN_LINK, 76, 20).expect("small");
+        let large = fit_qr(LOGIN_LINK, 180, 50).expect("large");
+        let small_width = UnicodeWidthStr::width(small[0].as_str());
+        let large_width = UnicodeWidthStr::width(large[0].as_str());
+        assert!(large_width > small_width);
+    }
+
+    #[test]
+    fn tiny_terminal_keeps_the_link_instead_of_a_clipped_code() {
+        let (lines, card_width) = plan_sign_in_qr(LOGIN_LINK, 30, 12);
+        assert!(qr_rows(&lines).is_empty());
+        assert!(card_width <= 30);
+        assert!(lines
+            .iter()
+            .any(|line| matches!(line, PlannedLine::Dim(text) if text.contains("tg://login"))));
     }
 
     #[test]
