@@ -410,7 +410,7 @@ impl LoginWindow {
         for (index, label) in options.iter().enumerate() {
             let marker = if index == selected { ">" } else { " " };
             let style = if index == selected {
-                self.app_context.style_item_selected()
+                active_style()
             } else {
                 Style::default()
             };
@@ -442,10 +442,7 @@ impl LoginWindow {
             Line::from(intro.to_string()),
             Line::from(""),
             Line::from(label.to_string()),
-            Line::from(Span::styled(
-                format!(" {shown}█"),
-                self.app_context.style_item_selected(),
-            )),
+            Line::from(Span::styled(format!(" {shown}█"), active_style())),
             Line::from(""),
             hint(footer),
         ];
@@ -460,7 +457,7 @@ impl LoginWindow {
         };
         let style_for = |active| {
             if active {
-                self.app_context.style_item_selected()
+                active_style()
             } else {
                 Style::default()
             }
@@ -658,6 +655,14 @@ impl Component for LoginWindow {
         self.draw_card(frame, area, lines, width);
         Ok(())
     }
+}
+
+/// Black on white, so the active row stays readable on light and dark terminals.
+fn active_style() -> Style {
+    Style::default()
+        .fg(ratatui::style::Color::Black)
+        .bg(ratatui::style::Color::White)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn hint(text: &str) -> Line<'static> {
