@@ -16,8 +16,19 @@ use tdlib_rs::types::{
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
+use super::login_phase::TdAuth;
 use super::message_entry::MessageEntry;
 use super::td_enums::TdMessageReplyToMessage;
+
+/// Result of applying one TDLib authorization update.
+pub enum AppliedAuth {
+    /// The sign-in card should show this step.
+    Phase(TdAuth),
+    /// TDLib closed the client.
+    Closed,
+    /// Parameters, logout, or another state that does not change the card.
+    Unchanged,
+}
 
 /// Fetches one or more batches of chat history (for background task). Does not hold any app locks.
 pub async fn fetch_chat_history_background(
@@ -590,175 +601,239 @@ impl TgBackend {
         }
     }
 
-    #[allow(clippy::await_holding_lock)]
-    pub async fn handle_authorization_state(&mut self) {
-        tracing::info!("Handling authorization state");
-        let telegram_config = self.app_context.telegram_config();
-        let api_id: i32 = {
-            if !self
-                .app_context
-                .app_config()
-                .take_api_id_from_telegram_config
-            {
-                // `env!("API_ID").parse().unwrap()` generates a compile time error
-                if let Ok(api_id) = std::env::var("API_ID") {
-                    api_id.parse().unwrap()
-                } else {
-                    tracing::error!("API_ID not found in environment");
-                    "-1".parse().unwrap() // This will throw the tdlib-rs error message
+    /// Apply one authorization update.
+    ///
+    /// States that need no typing are handled here. States that need the sign-in
+    /// card are returned as [`AppliedAuth::Phase`] and are not prompted on stdin.
+    pub async fn apply_auth_update(&mut self, state: AuthorizationState) -> AppliedAuth {
+        match state {
+            AuthorizationState::WaitTdlibParameters => {
+                if let Err(error) = self.apply_tdlib_parameters().await {
+                    tracing::error!("Failed to set TDLib parameters: {}", error.message);
                 }
-            } else {
-                telegram_config.api_id.parse().unwrap()
+                AppliedAuth::Unchanged
             }
-        };
-        let api_hash: String = {
-            if !self
-                .app_context
-                .app_config()
-                .take_api_hash_from_telegram_config
-            {
-                // `env!("API_HASH").into()` generates a compile time error
-                if let Ok(api_hash) = std::env::var("API_HASH") {
-                    api_hash
-                } else {
-                    tracing::error!("API_HASH not found in environment");
-                    "".into() // This will throw the tdlib-rs error message
-                }
-            } else {
-                telegram_config.api_hash.clone()
+            AuthorizationState::WaitPhoneNumber => AppliedAuth::Phase(TdAuth::WaitPhoneNumber),
+            AuthorizationState::WaitOtherDeviceConfirmation(confirmation) => {
+                tracing::info!(link = %confirmation.link, "qr login link");
+                AppliedAuth::Phase(TdAuth::WaitOtherDevice {
+                    link: confirmation.link,
+                })
             }
-        };
-        let database_dir = telegram_config.database_dir.clone();
-        tracing::info!("TDLib database directory: {}", database_dir);
-        let use_file_database = telegram_config.use_file_database;
-        let use_chat_info_database = telegram_config.use_chat_info_database;
-        let use_message_database = telegram_config.use_message_database;
-        let system_language_code = telegram_config.system_language_code.clone();
-        let device_model = telegram_config.device_model.clone();
-        let proxy_cfg = telegram_config.proxy.clone();
+            AuthorizationState::WaitEmailAddress(_) => AppliedAuth::Phase(TdAuth::WaitEmail),
+            AuthorizationState::WaitEmailCode(_) => AppliedAuth::Phase(TdAuth::WaitEmailCode),
+            AuthorizationState::WaitCode(_) => AppliedAuth::Phase(TdAuth::WaitCode),
+            AuthorizationState::WaitRegistration(_) => AppliedAuth::Phase(TdAuth::WaitRegistration),
+            AuthorizationState::WaitPassword(_) => AppliedAuth::Phase(TdAuth::WaitPassword),
+            AuthorizationState::Ready => {
+                self.have_authorization = true;
+                AppliedAuth::Phase(TdAuth::Ready)
+            }
+            AuthorizationState::LoggingOut => {
+                self.have_authorization = false;
+                tracing::info!("Logging out");
+                AppliedAuth::Unchanged
+            }
+            AuthorizationState::Closing => {
+                self.have_authorization = false;
+                tracing::info!("Closing");
+                AppliedAuth::Unchanged
+            }
+            AuthorizationState::Closed => {
+                tracing::info!("Closed");
+                self.can_quit.store(true, Ordering::Release);
+                AppliedAuth::Closed
+            }
+            AuthorizationState::WaitPremiumPurchase(_) => {
+                tracing::info!("Waiting for premium purchase confirmation");
+                AppliedAuth::Unchanged
+            }
+        }
+    }
 
-        while let Some(state) = self.auth_rx.recv().await {
-            match state {
-                AuthorizationState::WaitTdlibParameters => {
-                    let response = functions::set_tdlib_parameters(
-                        false,
-                        database_dir.clone(),
-                        String::new(),
-                        String::new(),
-                        use_file_database,
-                        use_chat_info_database,
-                        use_message_database,
-                        false,
-                        api_id,
-                        api_hash.clone(),
-                        system_language_code.clone(),
-                        device_model.clone(),
-                        String::new(),
-                        env!("CARGO_PKG_VERSION").into(),
-                        self.client_id,
-                    )
-                    .await;
+    /// Read every authorization update already queued.
+    pub async fn poll_auth(&mut self) -> Vec<AppliedAuth> {
+        let mut updates = Vec::new();
+        while let Ok(state) = self.auth_rx.try_recv() {
+            updates.push(self.apply_auth_update(state).await);
+        }
+        updates
+    }
 
-                    if let Err(error) = response {
-                        println!("{}", error.message);
-                    }
+    /// Block until the next authorization update arrives.
+    pub async fn recv_auth(&mut self) -> Option<AppliedAuth> {
+        let state = self.auth_rx.recv().await?;
+        Some(self.apply_auth_update(state).await)
+    }
 
-                    // Set up proxy before TDLib establishes connections
-                    if let Some(ref cfg) = proxy_cfg {
-                        self.setup_proxy(cfg).await;
-                    }
-                }
-                AuthorizationState::WaitPhoneNumber => loop {
-                    let phone_number =
-                        ask_user("Enter your phone number (include the country calling code):");
-                    let response = functions::set_authentication_phone_number(
-                        phone_number,
-                        None,
-                        self.client_id,
-                    )
-                    .await;
-                    match response {
-                        Ok(_) => break,
-                        Err(e) => println!("{}", e.message),
-                    }
-                },
-                AuthorizationState::WaitOtherDeviceConfirmation(x) => {
-                    println!(
-                        "Please confirm this login link on another device: {}",
-                        x.link
-                    );
-                }
-                AuthorizationState::WaitEmailAddress(_x) => {
-                    let email_address = ask_user("Please enter email address: ");
-                    let response =
-                        functions::set_authentication_email_address(email_address, self.client_id)
-                            .await;
-                    match response {
-                        Ok(_) => break,
-                        Err(e) => println!("{}", e.message),
-                    }
-                }
-                AuthorizationState::WaitEmailCode(_x) => {
-                    let code = ask_user("Please enter email authentication code: ");
-                    let response = functions::check_authentication_email_code(
-                        enums::EmailAddressAuthentication::Code(
-                            tdlib_rs::types::EmailAddressAuthenticationCode { code },
-                        ),
-                        self.client_id,
-                    )
-                    .await;
-                    match response {
-                        Ok(_) => break,
-                        Err(e) => println!("{}", e.message),
-                    }
-                }
-                AuthorizationState::WaitCode(_x) => loop {
-                    // x contains info about verification code
-                    let code = ask_user("Enter the verification code:");
-                    let response = functions::check_authentication_code(code, self.client_id).await;
-                    match response {
-                        Ok(_) => break,
-                        Err(e) => println!("{}", e.message),
-                    }
-                },
-                AuthorizationState::WaitRegistration(_x) => {
-                    // x useless but contains the TOS if we want to show it
-                    let first_name = ask_user("Please enter your first name: ");
-                    let last_name = ask_user("Please enter your last name: ");
-                    functions::register_user(first_name, last_name, false, self.client_id)
-                        .await
-                        .unwrap();
-                }
-                AuthorizationState::WaitPassword(_x) => {
-                    let password = ask_user("Please enter password: ");
-                    functions::check_authentication_password(password, self.client_id)
-                        .await
-                        .unwrap();
-                }
-                AuthorizationState::Ready => {
-                    // Maybe block all until this state is reached
-                    self.have_authorization = true;
-                    break;
-                }
-                AuthorizationState::LoggingOut => {
-                    self.have_authorization = false;
-                    tracing::info!("Logging out");
-                }
-                AuthorizationState::Closing => {
-                    self.have_authorization = false;
-                    tracing::info!("Closing");
-                }
-                AuthorizationState::Closed => {
-                    tracing::info!("Closed");
+    /// Wait until TDLib reports that the client is closed.
+    pub async fn drain_until_closed(&mut self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("Timed out waiting for TDLib to close");
+                self.can_quit.store(true, Ordering::Release);
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    tracing::warn!("Timed out waiting for TDLib to close");
                     self.can_quit.store(true, Ordering::Release);
                     break;
                 }
-                AuthorizationState::WaitPremiumPurchase(_) => {
-                    // Wait for user to complete premium purchase on another device or skip
-                    tracing::info!("Waiting for premium purchase confirmation");
+                update = self.auth_rx.recv() => {
+                    let Some(state) = update else {
+                        self.can_quit.store(true, Ordering::Release);
+                        break;
+                    };
+                    if matches!(self.apply_auth_update(state).await, AppliedAuth::Closed) {
+                        break;
+                    }
                 }
             }
         }
+    }
+
+    /// Start QR-code login. The link arrives later as `WaitOtherDevice`.
+    pub async fn request_qr_login(&self) -> Result<(), tdlib_rs::types::Error> {
+        functions::request_qr_code_authentication(Vec::<i64>::new(), self.client_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send the phone number from the sign-in card.
+    pub async fn submit_phone(&self, phone_number: String) -> Result<(), tdlib_rs::types::Error> {
+        functions::set_authentication_phone_number(phone_number, None, self.client_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send the login code from the sign-in card.
+    pub async fn submit_code(&self, code: String) -> Result<(), tdlib_rs::types::Error> {
+        functions::check_authentication_code(code, self.client_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send the cloud password from the sign-in card.
+    pub async fn submit_password(&self, password: String) -> Result<(), tdlib_rs::types::Error> {
+        functions::check_authentication_password(password, self.client_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send an email address Telegram asked for.
+    pub async fn submit_email(&self, email_address: String) -> Result<(), tdlib_rs::types::Error> {
+        functions::set_authentication_email_address(email_address, self.client_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send the email verification code.
+    pub async fn submit_email_code(&self, code: String) -> Result<(), tdlib_rs::types::Error> {
+        functions::check_authentication_email_code(
+            enums::EmailAddressAuthentication::Code(
+                tdlib_rs::types::EmailAddressAuthenticationCode { code },
+            ),
+            self.client_id,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Register a new account with the names from the sign-in card.
+    pub async fn submit_registration(
+        &self,
+        first_name: String,
+        last_name: String,
+    ) -> Result<(), tdlib_rs::types::Error> {
+        functions::register_user(first_name, last_name, false, self.client_id)
+            .await
+            .map(|_| ())
+    }
+
+    async fn apply_tdlib_parameters(&self) -> Result<(), tdlib_rs::types::Error> {
+        let (
+            api_id,
+            api_hash,
+            database_dir,
+            use_file_database,
+            use_chat_info_database,
+            use_message_database,
+            system_language_code,
+            device_model,
+            proxy_cfg,
+        ) = {
+            let telegram_config = self.app_context.telegram_config();
+            let take_api_id = self
+                .app_context
+                .app_config()
+                .take_api_id_from_telegram_config;
+            let take_api_hash = self
+                .app_context
+                .app_config()
+                .take_api_hash_from_telegram_config;
+            let api_id: i32 = if !take_api_id {
+                match std::env::var("API_ID") {
+                    Ok(api_id) => api_id.parse().unwrap_or(-1),
+                    Err(_) => {
+                        tracing::error!("API_ID not found in environment");
+                        -1
+                    }
+                }
+            } else {
+                telegram_config.api_id.parse().unwrap_or(-1)
+            };
+            let api_hash = if !take_api_hash {
+                match std::env::var("API_HASH") {
+                    Ok(api_hash) => api_hash,
+                    Err(_) => {
+                        tracing::error!("API_HASH not found in environment");
+                        String::new()
+                    }
+                }
+            } else {
+                telegram_config.api_hash.clone()
+            };
+            tracing::info!("TDLib database directory: {}", telegram_config.database_dir);
+            (
+                api_id,
+                api_hash,
+                telegram_config.database_dir.clone(),
+                telegram_config.use_file_database,
+                telegram_config.use_chat_info_database,
+                telegram_config.use_message_database,
+                telegram_config.system_language_code.clone(),
+                telegram_config.device_model.clone(),
+                telegram_config.proxy.clone(),
+            )
+        };
+
+        let response = functions::set_tdlib_parameters(
+            false,
+            database_dir,
+            String::new(),
+            String::new(),
+            use_file_database,
+            use_chat_info_database,
+            use_message_database,
+            false,
+            api_id,
+            api_hash,
+            system_language_code,
+            device_model,
+            String::new(),
+            env!("CARGO_PKG_VERSION").into(),
+            self.client_id,
+        )
+        .await;
+
+        if response.is_ok() {
+            if let Some(ref cfg) = proxy_cfg {
+                self.setup_proxy(cfg).await;
+            }
+        }
+        response.map(|_| ())
     }
 
     fn set_chat_positions(
@@ -850,6 +925,7 @@ impl TgBackend {
                             }
                             Update::AuthorizationState(update) => {
                                 auth_tx.send(update.authorization_state).unwrap();
+                                let _ = wake_tx.send(());
                             }
                             Update::User(update_user) => {
                                 tg_context
@@ -1379,11 +1455,4 @@ impl TgBackend {
             }
         });
     }
-}
-
-fn ask_user(string: &str) -> String {
-    println!("{string}");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
-    input.trim().to_string()
 }

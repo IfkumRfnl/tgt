@@ -6,7 +6,7 @@ use crate::{
         app_custom::AppConfig, keymap_custom::KeymapConfig, palette_custom::PaletteConfig,
         telegram_custom::TelegramConfig, theme_custom::ThemeConfig,
     },
-    tg::tg_context::TgContext,
+    tg::{login_phase::TdAuth, tg_context::TgContext},
 };
 use ratatui::style::Style;
 use std::sync::{
@@ -97,8 +97,10 @@ pub struct AppContext {
     /// The CLI arguments for the application.
     cli_args: Mutex<CliArgs>,
     /// The currently focused UI component, used for context-aware keymap lookup in the run loop.
-    /// Uses AtomicU8 for lock-free reads/writes. Encoded as: 0 = None, 1-14 = ComponentName variants.
+    /// Uses AtomicU8 for lock-free reads/writes. Encoded as: 0 = None, 1-15 = ComponentName variants.
     focused_component: AtomicU8,
+    /// Latest authorization step reported by TDLib.
+    td_auth: Mutex<TdAuth>,
     /// Result of background photo decode; consumed by PhotoViewer on PhotoDecoded(i64).
     pending_photo_decoded: Mutex<Option<(i64, Result<image::DynamicImage, String>)>>,
 
@@ -149,6 +151,7 @@ impl AppContext {
             tg_context: Arc::new(tg_context),
             cli_args: Mutex::new(cli_args),
             focused_component: AtomicU8::new(0), // 0 = None
+            td_auth: Mutex::new(TdAuth::Starting),
             pending_photo_decoded: Mutex::new(None),
             #[cfg(feature = "rodio")]
             voice_playback_state: Mutex::new(crate::voice_playback::VoicePlaybackState::default()),
@@ -344,7 +347,7 @@ impl AppContext {
     }
 
     /// Encodes `Option<ComponentName>` to a `u8` for atomic storage.
-    /// Encoding: 0 = None, 1-14 = ComponentName variants.
+    /// Encoding: 0 = None, 1-15 = ComponentName variants.
     #[inline]
     fn encode_component(component: Option<ComponentName>) -> u8 {
         match component {
@@ -363,6 +366,7 @@ impl AppContext {
             Some(ComponentName::FileUploadExplorer) => 12,
             Some(ComponentName::FileDownloadExplorer) => 13,
             Some(ComponentName::PinnedMessagesPopup) => 14,
+            Some(ComponentName::Login) => 15,
         }
     }
 
@@ -385,8 +389,20 @@ impl AppContext {
             12 => Some(ComponentName::FileUploadExplorer),
             13 => Some(ComponentName::FileDownloadExplorer),
             14 => Some(ComponentName::PinnedMessagesPopup),
+            15 => Some(ComponentName::Login),
             _ => None, // Invalid encoding, treat as None
         }
+    }
+
+    /// Latest TDLib authorization step.
+    pub fn td_auth(&self) -> TdAuth {
+        self.td_auth.lock().unwrap().clone()
+    }
+
+    /// Replace the authorization step and ask for a redraw.
+    pub fn set_td_auth(&self, auth: TdAuth) {
+        *self.td_auth.lock().unwrap() = auth;
+        self.mark_dirty();
     }
 
     /// Returns the currently focused UI component for context-aware keymap lookup.

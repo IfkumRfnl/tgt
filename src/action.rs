@@ -323,6 +323,23 @@ pub enum Action {
     HideFileDownloadExplorer,
     /// Download/copy a Telegram file to `dest_path` (full path including file name).
     SaveChatFileAs { message_id: i64, dest_path: String },
+
+    /// Ask TDLib for a QR login link.
+    LoginSelectQr,
+    /// Submit the phone number from the sign-in card.
+    LoginSubmitPhone(String),
+    /// Submit the SMS or app login code.
+    LoginSubmitCode(String),
+    /// Submit the cloud password.
+    LoginSubmitPassword(String),
+    /// Submit an email address Telegram asked for.
+    LoginSubmitEmail(String),
+    /// Submit the email verification code.
+    LoginSubmitEmailCode(String),
+    /// Submit first and last name for a new account.
+    LoginSubmitRegistration { first: String, last: String },
+    /// A sign-in request was rejected. The card shows `message`.
+    LoginFailed(String),
 }
 /// Implement the `Action` enum.
 impl Action {

@@ -4,10 +4,11 @@ use crate::{
     app_error::AppError,
     component_name::ComponentName,
     components::{
-        component_traits::Component, core_window::CoreWindow, status_bar::StatusBar,
-        title_bar::TitleBar, SMALL_AREA_HEIGHT, SMALL_AREA_WIDTH,
+        component_traits::Component, core_window::CoreWindow, login_window::LoginWindow,
+        status_bar::StatusBar, title_bar::TitleBar, SMALL_AREA_HEIGHT, SMALL_AREA_WIDTH,
     },
     event::Event,
+    tg::login_phase::TdAuth,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::{collections::HashMap, sync::Arc};
@@ -24,6 +25,8 @@ pub struct Tui {
     action_tx: Option<UnboundedSender<Action>>,
     /// A hashmap of components that make up the user interface.
     components: HashMap<ComponentName, Box<dyn Component>>,
+    /// Sign-in card. Drawn instead of the chat shell until TDLib is ready.
+    login: LoginWindow,
 }
 /// Implement the `Tui` struct.
 impl Tui {
@@ -59,10 +62,13 @@ impl Tui {
         let components: HashMap<ComponentName, Box<dyn Component>> =
             components_iter.into_iter().collect();
 
+        let login = LoginWindow::new(Arc::clone(&app_context));
+
         Tui {
             action_tx,
             components,
             app_context,
+            login,
         }
     }
     /// Register an action handler that can send actions for processing if
@@ -96,6 +102,9 @@ impl Tui {
         &mut self,
         event: Option<Event>,
     ) -> Result<Option<Action>, AppError<Action>> {
+        if self.app_context.focused_component() == Some(ComponentName::Login) {
+            return self.login.handle_events(event);
+        }
         self.components
             .get_mut(&ComponentName::CoreWindow)
             .unwrap()
@@ -109,6 +118,7 @@ impl Tui {
     pub fn update(&mut self, action: Action) {
         // We can not send the action only to the `CoreWindow` component because
         // the `StatusBar` component needs to know the area to render the size.
+        self.login.update(action.clone());
         self.components
             .iter_mut()
             .for_each(|(_, component)| component.update(action.clone()));
@@ -122,6 +132,11 @@ impl Tui {
     /// # Returns
     /// * `Result<()>` - An Ok result or an error.
     pub fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> Result<(), AppError<()>> {
+        if !matches!(self.app_context.td_auth(), TdAuth::Ready) {
+            self.login.draw(frame, area)?;
+            return Ok(());
+        }
+
         self.components
             .get_mut(&ComponentName::StatusBar)
             .unwrap()

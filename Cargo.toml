@@ -79,6 +79,7 @@ ogg = { version = "0.9", optional = true }
 # Opus codec for Telegram voice notes (via audiopus_sys; requires CMake when building with voice-message).
 audiopus = { version = "0.2", optional = true }
 ratatui-explorer = "0.3.0"
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 arboard = { version = "3.6.1", features = ["wayland-data-control", "wl-clipboard-rs"] }

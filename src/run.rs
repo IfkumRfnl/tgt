@@ -1,8 +1,13 @@
-use crate::component_name::ComponentName::Prompt;
+use crate::component_name::ComponentName::{self, Prompt};
 use crate::{
-    action::Action, app_context::AppContext, app_error::AppError,
-    configs::custom::keymap_custom::ActionBinding, event::Event, tg::tg_backend::TgBackend,
-    tui::Tui, tui_backend::TuiBackend,
+    action::Action,
+    app_context::AppContext,
+    app_error::AppError,
+    configs::custom::keymap_custom::ActionBinding,
+    event::Event,
+    tg::{login_phase::TdAuth, tg_backend::TgBackend},
+    tui::Tui,
+    tui_backend::TuiBackend,
 };
 use ratatui::layout::Rect;
 use std::{collections::HashMap, io, sync::Arc, time::Duration, time::Instant};
@@ -28,37 +33,18 @@ pub async fn run_app(
 ) -> Result<(), AppError<Action>> {
     tracing::info!("Starting run_app");
 
-    // Clear the terminal and move the cursor to the top left corner
-    io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
-
     // Wake channel for TG: when a new message (or other UI event) is pushed, we wake the main loop immediately.
     let (tg_wake_tx, mut tg_wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     tg_backend.start(tg_wake_tx);
     tg_backend.set_logging().await;
-    tg_backend.handle_authorization_state().await;
-    tg_backend.use_quick_ack().await;
-    tg_backend.get_me().await;
-    // On startup, fetch a larger chunk of the main chat list so the UI reaches a "latest state"
-    // quickly and doesn't feel like it's incrementally catching up for a long time.
-    tg_backend.load_chats(ChatList::Main, 200).await;
 
-    match handle_cli(Arc::clone(&app_context), tg_backend).await {
-        HandleCliOutcome::Quit => {
-            futures::join!(quit_cli(tg_backend));
-            return Ok(());
-        }
-        HandleCliOutcome::Logout => {
-            futures::join!(log_out(tg_backend));
-            return Ok(());
-        }
-        HandleCliOutcome::Continue => {}
+    if cli_requests_session(app_context.as_ref()) {
+        return run_cli_session(app_context, tg_backend).await;
     }
-
-    tg_backend.online().await;
-    tg_backend.disable_animated_emoji(true).await;
 
     tui_backend.enter()?;
     tui.register_action_handler(app_context.action_tx().clone())?;
+    app_context.set_focused_component(Some(ComponentName::Login));
     app_context.mark_dirty();
 
     // Voice wake: playback thread signals so status bar position updates immediately.
@@ -72,11 +58,6 @@ pub async fn run_app(
     }
     #[cfg(not(feature = "rodio"))]
     let _voice_wake_tx = voice_wake_tx;
-
-    // Notify ChatList to populate visible_chats from initial load (it only rebuilds on LoadChats/ChatHistoryAppended/Resize).
-    let _ = app_context
-        .action_tx()
-        .send(Action::LoadChats(ChatList::Main.into(), 200));
 
     // Refresh task: ~60 FPS. We no longer block on TUI/TG in the select, so this won't spin; wake + drain keeps UI responsive.
     const REFRESH_MS: u64 = 16; // 1000/60 ≈ 60 FPS
@@ -94,8 +75,9 @@ pub async fn run_app(
         }
     });
 
-    // Main loop: one blocking wait (sleep | refresh wake | TG wake), then drain TUI and TG; no select on backends so no spin.
-    while tg_backend.have_authorization {
+    // Main loop runs before authorization. The sign-in card is the screen until Ready.
+    let mut session_booted = false;
+    while !app_context.quit_acquire() {
         let wait_ms = REFRESH_MS;
 
         tokio::select! {
@@ -107,20 +89,109 @@ pub async fn run_app(
         while let Some(ev) = tui_backend.try_next() {
             handle_tui_backend_one_event(Arc::clone(&app_context), tui, tui_backend, ev).await?;
         }
+        if note_auth_updates(Arc::clone(&app_context), tg_backend, &mut session_booted).await {
+            break;
+        }
         while let Some(ev) = tg_backend.next().await {
             handle_tg_backend_one_event(Arc::clone(&app_context), tg_backend, ev).await?;
         }
         handle_app_actions(Arc::clone(&app_context), tui, tui_backend, tg_backend).await?;
-
-        if app_context.quit_acquire() {
-            quit_tui(tg_backend, tui_backend).await;
-            tracing::info!("Quitting");
-            return Ok(());
-        }
     }
 
+    quit_tui(tg_backend, tui_backend).await;
+    tracing::info!("Quitting");
     Ok(())
 }
+
+fn cli_requests_session(app_context: &AppContext) -> bool {
+    let args = app_context.cli_args();
+    let telegram = args.telegram_cli();
+    telegram.logout() || telegram.send_message().is_some()
+}
+
+enum HeadlessAuth {
+    Ready,
+    NeedsLogin,
+    Closed,
+}
+
+async fn auth_headless(tg_backend: &mut TgBackend) -> HeadlessAuth {
+    use crate::tg::tg_backend::AppliedAuth;
+    loop {
+        match tg_backend.recv_auth().await {
+            None | Some(AppliedAuth::Closed) => return HeadlessAuth::Closed,
+            Some(AppliedAuth::Unchanged) => {}
+            Some(AppliedAuth::Phase(TdAuth::Ready)) => return HeadlessAuth::Ready,
+            Some(AppliedAuth::Phase(phase)) if phase.needs_user() => {
+                return HeadlessAuth::NeedsLogin
+            }
+            Some(AppliedAuth::Phase(_)) => {}
+        }
+    }
+}
+
+async fn run_cli_session(
+    app_context: Arc<AppContext>,
+    tg_backend: &mut TgBackend,
+) -> Result<(), AppError<Action>> {
+    match auth_headless(tg_backend).await {
+        HeadlessAuth::NeedsLogin => {
+            println!("Not signed in. Run tgt to sign in, then retry this command.");
+            tg_backend.close().await;
+            tg_backend.drain_until_closed().await;
+            return Ok(());
+        }
+        HeadlessAuth::Closed => return Ok(()),
+        HeadlessAuth::Ready => {}
+    }
+    boot_session(Arc::clone(&app_context), tg_backend).await;
+    match handle_cli(app_context, tg_backend).await {
+        HandleCliOutcome::Quit | HandleCliOutcome::Continue => quit_cli(tg_backend).await,
+        HandleCliOutcome::Logout => log_out(tg_backend).await,
+    }
+    Ok(())
+}
+
+/// Apply queued authorization updates. Returns true when the client has closed.
+async fn note_auth_updates(
+    app_context: Arc<AppContext>,
+    tg_backend: &mut TgBackend,
+    session_booted: &mut bool,
+) -> bool {
+    use crate::tg::tg_backend::AppliedAuth;
+    for update in tg_backend.poll_auth().await {
+        match update {
+            AppliedAuth::Phase(phase) => {
+                let ready = matches!(phase, TdAuth::Ready);
+                app_context.set_td_auth(phase);
+                if ready && !*session_booted {
+                    boot_session(Arc::clone(&app_context), tg_backend).await;
+                    *session_booted = true;
+                }
+            }
+            AppliedAuth::Closed => {
+                app_context.quit_store(true);
+                return true;
+            }
+            AppliedAuth::Unchanged => {}
+        }
+    }
+    false
+}
+
+async fn boot_session(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) {
+    tg_backend.have_authorization = true;
+    tg_backend.use_quick_ack().await;
+    tg_backend.get_me().await;
+    tg_backend.load_chats(ChatList::Main, 200).await;
+    tg_backend.online().await;
+    tg_backend.disable_animated_emoji(true).await;
+    app_context.set_focused_component(None);
+    let _ = app_context
+        .action_tx()
+        .send(Action::LoadChats(ChatList::Main.into(), 200));
+}
+
 /// Handle a single Telegram backend event.
 async fn handle_tg_backend_one_event(
     app_context: Arc<AppContext>,
@@ -206,6 +277,12 @@ async fn handle_tui_backend_one_event(
                 .send(Action::Resize(width, height))?;
         }
         Event::Key(key, modifiers) => {
+            if app_context.focused_component() == Some(ComponentName::Login) {
+                if let Some(action) = tui.handle_events(Some(Event::Key(key, modifiers)))? {
+                    app_context.action_tx().send(action)?;
+                }
+                return Ok(());
+            }
             let focused = app_context.focused_component();
             let keymap_config = app_context.keymap_config();
             let key_event = Event::Key(key, modifiers);
@@ -240,7 +317,15 @@ async fn handle_tui_backend_one_event(
         }
         Event::FocusLost => app_context.action_tx().send(Action::FocusLost)?,
         Event::FocusGained => app_context.action_tx().send(Action::FocusGained)?,
-        Event::Paste(ref text) => app_context.action_tx().send(Action::Paste(text.clone()))?,
+        Event::Paste(ref text) => {
+            if app_context.focused_component() == Some(ComponentName::Login) {
+                if let Some(action) = tui.handle_events(Some(Event::Paste(text.clone())))? {
+                    app_context.action_tx().send(action)?;
+                }
+                return Ok(());
+            }
+            app_context.action_tx().send(Action::Paste(text.clone()))?
+        }
         _ => {}
     }
 
@@ -385,6 +470,14 @@ fn action_changes_ui(action: &Action) -> bool {
             | Action::UpdateArea(_)
             | Action::GetChatHistoryNewer
             | Action::ChatHistoryAppended
+            | Action::LoginSelectQr
+            | Action::LoginSubmitPhone(_)
+            | Action::LoginSubmitCode(_)
+            | Action::LoginSubmitPassword(_)
+            | Action::LoginSubmitEmail(_)
+            | Action::LoginSubmitEmailCode(_)
+            | Action::LoginSubmitRegistration { .. }
+            | Action::LoginFailed(_)
     )
 }
 
@@ -913,6 +1006,65 @@ pub async fn handle_app_actions(
                     state.is_playing = false;
                 }
             }
+            Action::LoginSelectQr => {
+                if let Err(error) = tg_backend.request_qr_login().await {
+                    tracing::error!("QR login request failed: {}", error.message);
+                    let _ = app_context
+                        .action_tx()
+                        .send(Action::LoginFailed(error.message));
+                }
+            }
+            Action::LoginSubmitPhone(phone) => {
+                if let Err(error) = tg_backend.submit_phone(phone.clone()).await {
+                    tracing::error!("Phone submit failed: {}", error.message);
+                    let _ = app_context
+                        .action_tx()
+                        .send(Action::LoginFailed(error.message));
+                }
+            }
+            Action::LoginSubmitCode(code) => {
+                if let Err(error) = tg_backend.submit_code(code.clone()).await {
+                    tracing::error!("Code submit failed: {}", error.message);
+                    let _ = app_context
+                        .action_tx()
+                        .send(Action::LoginFailed(error.message));
+                }
+            }
+            Action::LoginSubmitPassword(password) => {
+                if let Err(error) = tg_backend.submit_password(password.clone()).await {
+                    tracing::error!("Password submit failed: {}", error.message);
+                    let _ = app_context
+                        .action_tx()
+                        .send(Action::LoginFailed(error.message));
+                }
+            }
+            Action::LoginSubmitEmail(email) => {
+                if let Err(error) = tg_backend.submit_email(email.clone()).await {
+                    tracing::error!("Email submit failed: {}", error.message);
+                    let _ = app_context
+                        .action_tx()
+                        .send(Action::LoginFailed(error.message));
+                }
+            }
+            Action::LoginSubmitEmailCode(code) => {
+                if let Err(error) = tg_backend.submit_email_code(code.clone()).await {
+                    tracing::error!("Email code submit failed: {}", error.message);
+                    let _ = app_context
+                        .action_tx()
+                        .send(Action::LoginFailed(error.message));
+                }
+            }
+            Action::LoginSubmitRegistration { first, last } => {
+                if let Err(error) = tg_backend
+                    .submit_registration(first.clone(), last.clone())
+                    .await
+                {
+                    tracing::error!("Registration failed: {}", error.message);
+                    let _ = app_context
+                        .action_tx()
+                        .send(Action::LoginFailed(error.message));
+                }
+            }
             Action::LoadPhotoFromPath(path, message_id) => {
                 // Decode image on a blocking thread to avoid stalling the main loop
                 let photo_max_dimension = app_context.app_config().photo_max_dimension;
@@ -1078,7 +1230,7 @@ async fn quit_tui(tg_backend: &mut TgBackend, tui_backend: &mut TuiBackend) {
     tg_backend.have_authorization = false;
     tg_backend.close().await;
     tui_backend.exit();
-    tg_backend.handle_authorization_state().await;
+    tg_backend.drain_until_closed().await;
 
     // Clear the terminal and move the cursor to the top left corner
     io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
@@ -1091,7 +1243,7 @@ async fn quit_tui(tg_backend: &mut TgBackend, tui_backend: &mut TuiBackend) {
 async fn quit_cli(tg_backend: &mut TgBackend) {
     tg_backend.have_authorization = false;
     tg_backend.close().await;
-    tg_backend.handle_authorization_state().await;
+    tg_backend.drain_until_closed().await;
 
     // Clear the terminal and move the cursor to the top left corner
     io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
@@ -1103,7 +1255,7 @@ async fn quit_cli(tg_backend: &mut TgBackend) {
 /// * `tg_backend` - A mutable reference to the TgBackend struct.
 async fn log_out(tg_backend: &mut TgBackend) {
     tg_backend.log_out().await;
-    tg_backend.handle_authorization_state().await;
+    tg_backend.drain_until_closed().await;
 
     // Clear the terminal and move the cursor to the top left corner
     io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
