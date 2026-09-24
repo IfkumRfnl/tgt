@@ -1,5 +1,3 @@
-use tdlib_rs::enums::AuthorizationState;
-
 /// Authorization state needed by the sign-in screen.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub enum TdAuth {
@@ -42,28 +40,6 @@ impl std::fmt::Debug for TdAuth {
 }
 
 impl TdAuth {
-    /// Map a TDLib authorization update onto the subset the UI understands.
-    ///
-    /// States that need no screen (`WaitTdlibParameters`, closing, premium)
-    /// return `None`. The caller applies those itself.
-    pub fn from_authorization_state(state: &AuthorizationState) -> Option<Self> {
-        match state {
-            AuthorizationState::WaitPhoneNumber => Some(Self::WaitPhoneNumber),
-            AuthorizationState::WaitOtherDeviceConfirmation(confirmation) => {
-                Some(Self::WaitOtherDevice {
-                    link: confirmation.link.clone(),
-                })
-            }
-            AuthorizationState::WaitCode(_) => Some(Self::WaitCode),
-            AuthorizationState::WaitPassword(_) => Some(Self::WaitPassword),
-            AuthorizationState::WaitEmailAddress(_) => Some(Self::WaitEmail),
-            AuthorizationState::WaitEmailCode(_) => Some(Self::WaitEmailCode),
-            AuthorizationState::WaitRegistration(_) => Some(Self::WaitRegistration),
-            AuthorizationState::Ready => Some(Self::Ready),
-            _ => None,
-        }
-    }
-
     /// True when the user has to do something before the chat shell can open.
     pub fn needs_user(&self) -> bool {
         !matches!(self, Self::Starting | Self::Ready)

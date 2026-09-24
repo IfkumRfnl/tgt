@@ -590,45 +590,42 @@ impl TgBackend {
 
     /// Apply an authorization update; return true when the client has closed.
     pub async fn apply_auth_state(
-        &mut self,
+        &self,
         state: AuthorizationState,
     ) -> Result<bool, tdlib_rs::types::Error> {
-        if let Some(auth) = TdAuth::from_authorization_state(&state) {
-            if matches!(state, AuthorizationState::Ready) {
-                tracing::info!("TDLib authorization ready");
-            } else {
-                tracing::debug!("TDLib authorization step");
+        let closed = matches!(state, AuthorizationState::Closed);
+        let auth = match state {
+            AuthorizationState::WaitPhoneNumber => TdAuth::WaitPhoneNumber,
+            AuthorizationState::WaitOtherDeviceConfirmation(confirmation) => {
+                TdAuth::WaitOtherDevice {
+                    link: confirmation.link,
+                }
             }
-            self.app_context.set_td_auth(auth);
-            return Ok(false);
-        }
-        Ok(match state {
+            AuthorizationState::WaitCode(_) => TdAuth::WaitCode,
+            AuthorizationState::WaitPassword(_) => TdAuth::WaitPassword,
+            AuthorizationState::WaitEmailAddress(_) => TdAuth::WaitEmail,
+            AuthorizationState::WaitEmailCode(_) => TdAuth::WaitEmailCode,
+            AuthorizationState::WaitRegistration(_) => TdAuth::WaitRegistration,
+            AuthorizationState::Ready => TdAuth::Ready,
             AuthorizationState::WaitTdlibParameters => {
                 self.apply_tdlib_parameters().await?;
-                false
+                return Ok(false);
             }
-            AuthorizationState::LoggingOut => {
-                tracing::info!("Logging out");
-                self.app_context.set_td_auth(TdAuth::Starting);
-                false
-            }
-            AuthorizationState::Closing => {
-                tracing::info!("Closing");
-                self.app_context.set_td_auth(TdAuth::Starting);
-                false
-            }
+            AuthorizationState::LoggingOut | AuthorizationState::Closing => TdAuth::Starting,
             AuthorizationState::Closed => {
-                tracing::info!("Closed");
-                self.app_context.set_td_auth(TdAuth::Starting);
                 self.can_quit.store(true, Ordering::Release);
-                true
+                TdAuth::Starting
             }
             AuthorizationState::WaitPremiumPurchase(_) => {
                 tracing::info!("Waiting for premium purchase confirmation");
-                false
+                return Ok(false);
             }
-            _ => false,
-        })
+        };
+        // TdAuth's Debug redacts the login link.
+        tracing::debug!("TDLib authorization step: {auth:?}");
+        *self.app_context.td_auth() = auth;
+        self.app_context.mark_dirty();
+        Ok(closed)
     }
 
     /// Keep receiving until TDLib closes, bounded in case the client stops responding.
@@ -650,7 +647,8 @@ impl TgBackend {
                         break;
                     };
                     if matches!(state, AuthorizationState::Closed) {
-                        self.app_context.set_td_auth(TdAuth::Starting);
+                        *self.app_context.td_auth() = TdAuth::Starting;
+                        self.app_context.mark_dirty();
                         self.can_quit.store(true, Ordering::Release);
                         break;
                     }
@@ -706,7 +704,8 @@ impl TgBackend {
                 _ => Ok(()),
             };
             if let Err(error) = result {
-                tracing::error!("sign-in request failed: {}", error.message);
+                // Do not log server text or credential-bearing actions.
+                tracing::error!("sign-in request failed (code {})", error.code);
                 let _ = action_tx.send(Action::LoginFailed(error.message));
             }
         });

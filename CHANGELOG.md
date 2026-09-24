@@ -35,7 +35,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Fixed
 
-- QR login keeps its scanner quiet zone when resized, avoids logging login links, and clears credentials when authorization finishes.
+- QR login keeps its scanner quiet zone when resized or displaying errors, avoids logging login links, and clears credentials when authorization finishes.
+- Authorization and multi-key command handling release shared-context locks before asynchronous work.
+- Failed audio initialization disables playback instead of leaving a disconnected command sender.
 - Stack overflow in the prompt when wrapping at the window edge (`insert_newline` no longer recurses through `insert('\n')`).
 - Occasional startup hangs and chat list refresh hangs.
 - Chat search reliability and clearer failure feedback via the status bar.

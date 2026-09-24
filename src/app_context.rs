@@ -8,10 +8,11 @@ use crate::{
     },
     tg::{login_phase::TdAuth, tg_context::TgContext},
 };
+use parking_lot::{Mutex, MutexGuard};
 use ratatui::style::Style;
 use std::sync::{
     atomic::{AtomicBool, AtomicU8},
-    Arc, Mutex, MutexGuard,
+    Arc,
 };
 use std::{io, sync::atomic::Ordering};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -77,13 +78,9 @@ pub struct AppContext {
     palette_config: Mutex<PaletteConfig>,
     /// The Telegram configuration.
     tg_config: Mutex<TelegramConfig>,
-    /// An unbounded receiver that receives action for processing.
-    /// This is used to send actions from the main loop to the main loop.
-    /// A copy of this receiver is passed to all components.
+    /// Sender shared with components and background tasks to enqueue application actions.
     action_tx: Mutex<UnboundedSender<Action>>,
-    /// An unbounded sender that send action for processing.
-    /// This is used to receive events from the action queue for processing.
-    /// The main loop consumes actions from this receiver.
+    /// Receiver drained by the main application loop.
     action_rx: Mutex<UnboundedReceiver<Action>>,
     /// A boolean flag that represents whether the application should quit or
     /// not.
@@ -168,7 +165,7 @@ impl AppContext {
     /// # Returns
     /// * `MutexGuard<'_, AppConfig>` - The application configuration.
     pub fn app_config(&self) -> MutexGuard<'_, AppConfig> {
-        self.app_config.lock().unwrap()
+        self.app_config.lock()
     }
     /// Get the keymap configuration.
     /// This function takes the lock on the keymap configuration and returns the
@@ -178,7 +175,7 @@ impl AppContext {
     /// # Returns
     /// * `MutexGuard<'_, KeymapConfig>` - The keymap configuration.
     pub fn keymap_config(&self) -> MutexGuard<'_, KeymapConfig> {
-        self.keymap_config.lock().unwrap()
+        self.keymap_config.lock()
     }
     /// Get the theme configuration.
     /// This function takes the lock on the theme configuration and returns the
@@ -188,7 +185,7 @@ impl AppContext {
     /// # Returns
     /// * `MutexGuard<'_, ThemeConfig>` - The theme configuration.
     pub fn theme_config(&self) -> MutexGuard<'_, ThemeConfig> {
-        self.theme_config.lock().unwrap()
+        self.theme_config.lock()
     }
     /// Get the palette configuration.
     /// This function takes the lock on the palette configuration and returns the
@@ -198,7 +195,7 @@ impl AppContext {
     /// # Returns
     /// * `MutexGuard<'_, PaletteConfig>` - The palette configuration.
     pub fn palette_config(&self) -> MutexGuard<'_, PaletteConfig> {
-        self.palette_config.lock().unwrap()
+        self.palette_config.lock()
     }
     /// Get the Telegram configuration.
     /// This function takes the lock on the Telegram configuration and returns the
@@ -208,7 +205,7 @@ impl AppContext {
     /// # Returns
     /// * `MutexGuard<'_, TelegramConfig>` - The Telegram configuration.
     pub fn telegram_config(&self) -> MutexGuard<'_, TelegramConfig> {
-        self.tg_config.lock().unwrap()
+        self.tg_config.lock()
     }
     /// Get the action receiver.
     /// This function takes the lock on the action receiver and returns the action
@@ -218,7 +215,7 @@ impl AppContext {
     /// # Returns
     /// * `MutexGuard<'_, UnboundedReceiver<Action>>` - The action receiver.
     pub fn action_rx(&self) -> MutexGuard<'_, UnboundedReceiver<Action>> {
-        self.action_rx.lock().unwrap()
+        self.action_rx.lock()
     }
     /// Get the action sender.
     /// This function takes the lock on the action sender and returns the action
@@ -228,7 +225,7 @@ impl AppContext {
     /// # Returns
     /// * `MutexGuard<'_, UnboundedSender<Action>>` - The action sender.
     pub fn action_tx(&self) -> MutexGuard<'_, UnboundedSender<Action>> {
-        self.action_tx.lock().unwrap()
+        self.action_tx.lock()
     }
     /// Get the quit flag.
     /// This function returns the value of the quit flag.
@@ -286,7 +283,7 @@ impl AppContext {
         message_id: i64,
         result: Result<image::DynamicImage, String>,
     ) {
-        *self.pending_photo_decoded.lock().unwrap() = Some((message_id, result));
+        *self.pending_photo_decoded.lock() = Some((message_id, result));
     }
 
     /// Take decoded photo for PhotoViewer; returns None if message_id does not match or slot empty.
@@ -294,7 +291,7 @@ impl AppContext {
         &self,
         message_id: i64,
     ) -> Option<Result<image::DynamicImage, String>> {
-        let mut guard = self.pending_photo_decoded.lock().unwrap();
+        let mut guard = self.pending_photo_decoded.lock();
         let taken = guard.take()?;
         if taken.0 == message_id {
             Some(taken.1)
@@ -309,7 +306,7 @@ impl AppContext {
     pub fn voice_playback_state(
         &self,
     ) -> MutexGuard<'_, crate::voice_playback::VoicePlaybackState> {
-        self.voice_playback_state.lock().unwrap()
+        self.voice_playback_state.lock()
     }
 
     #[cfg(feature = "rodio")]
@@ -318,13 +315,13 @@ impl AppContext {
         &self,
         tx: std::sync::mpsc::Sender<crate::voice_playback::VoicePlaybackCommand>,
     ) {
-        *self.voice_playback_tx.lock().unwrap() = Some(tx);
+        *self.voice_playback_tx.lock() = Some(tx);
     }
 
     #[cfg(feature = "rodio")]
     /// Send a command to the voice playback thread. Returns false if channel disconnected (thread exited).
     pub fn voice_playback_send(&self, cmd: crate::voice_playback::VoicePlaybackCommand) -> bool {
-        if let Some(ref tx) = *self.voice_playback_tx.lock().unwrap() {
+        if let Some(ref tx) = *self.voice_playback_tx.lock() {
             tx.send(cmd).is_ok()
         } else {
             false
@@ -343,7 +340,12 @@ impl AppContext {
     /// arguments.
     /// The CLI arguments are a shared resource and are protected by a mutex.
     pub fn cli_args(&self) -> MutexGuard<'_, CliArgs> {
-        self.cli_args.lock().unwrap()
+        self.cli_args.lock()
+    }
+
+    /// Get the latest TDLib authorization step.
+    pub fn td_auth(&self) -> MutexGuard<'_, TdAuth> {
+        self.td_auth.lock()
     }
 
     /// Encodes `Option<ComponentName>` to a `u8` for atomic storage.
@@ -392,17 +394,6 @@ impl AppContext {
             15 => Some(ComponentName::Login),
             _ => None, // Invalid encoding, treat as None
         }
-    }
-
-    /// Latest TDLib authorization step.
-    pub fn td_auth(&self) -> TdAuth {
-        self.td_auth.lock().unwrap().clone()
-    }
-
-    /// Replace the authorization step and ask for a redraw.
-    pub fn set_td_auth(&self, auth: TdAuth) {
-        *self.td_auth.lock().unwrap() = auth;
-        self.mark_dirty();
     }
 
     /// Returns the currently focused UI component for context-aware keymap lookup.

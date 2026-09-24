@@ -137,15 +137,18 @@ async fn run_cli_session(
                 );
             }
         }
-        match app_context.td_auth() {
-            TdAuth::Ready => break,
-            phase if phase.needs_user() => {
-                println!("Not signed in. Run tgt to sign in, then retry this command.");
-                tg_backend.close().await;
-                tg_backend.drain_until_closed().await;
-                return Ok(());
-            }
-            _ => {}
+        let (ready, needs_login) = {
+            let auth = app_context.td_auth();
+            (matches!(*auth, TdAuth::Ready), auth.needs_user())
+        };
+        if ready {
+            break;
+        }
+        if needs_login {
+            println!("Not signed in. Run tgt to sign in, then retry this command.");
+            tg_backend.close().await;
+            tg_backend.drain_until_closed().await;
+            return Ok(());
         }
     }
     boot_session(Arc::clone(&app_context), tg_backend).await;
@@ -180,7 +183,8 @@ async fn drain_auth_states(
             }
         }
     }
-    if !*session_booted && matches!(app_context.td_auth(), TdAuth::Ready) {
+    let ready = matches!(*app_context.td_auth(), TdAuth::Ready);
+    if !*session_booted && ready {
         boot_session(Arc::clone(&app_context), tg_backend).await;
         *session_booted = true;
     }
@@ -267,7 +271,6 @@ async fn handle_tg_backend_one_event(
     Ok(())
 }
 
-#[allow(clippy::await_holding_lock)]
 /// Handle a single TUI backend event.
 async fn handle_tui_backend_one_event(
     app_context: Arc<AppContext>,
@@ -291,32 +294,31 @@ async fn handle_tui_backend_one_event(
                 return Ok(());
             }
             let focused = app_context.focused_component();
-            let keymap_config = app_context.keymap_config();
             let key_event = Event::Key(key, modifiers);
 
-            // Merged map (core + component): component map includes core_window + mode-specific keys.
-            let should_check_keymap =
-                focused.is_none() || keymap_config.get_map_of(focused).contains_key(&key_event);
-
-            if should_check_keymap {
-                let keymap = keymap_config.get_map_of(focused);
-                if let Some(action_binding) = keymap.get(&key_event) {
-                    match action_binding {
-                        ActionBinding::Single { action, .. } => {
-                            app_context.action_tx().send(action.clone())?;
-                            return Ok(());
-                        }
-                        ActionBinding::Multiple(map_event_action) => {
-                            consume_until_single_action(
-                                &app_context.action_tx(),
-                                tui_backend,
-                                map_event_action.clone(),
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                    }
+            // Snapshot the binding while the keymap guard is held; neither the
+            // keymap guard nor the sender guard may live through the awaits below.
+            let matched = {
+                let keymap_config = app_context.keymap_config();
+                let should_check =
+                    focused.is_none() || keymap_config.get_map_of(focused).contains_key(&key_event);
+                if should_check {
+                    keymap_config.get_map_of(focused).get(&key_event).cloned()
+                } else {
+                    None
                 }
+            };
+            match matched {
+                Some(ActionBinding::Single { action, .. }) => {
+                    app_context.action_tx().send(action)?;
+                    return Ok(());
+                }
+                Some(ActionBinding::Multiple(map_event_action)) => {
+                    let action_tx = app_context.action_tx().clone();
+                    consume_until_single_action(&action_tx, tui_backend, map_event_action).await;
+                    return Ok(());
+                }
+                None => {}
             }
             app_context
                 .action_tx()
@@ -342,7 +344,6 @@ async fn handle_tui_backend_one_event(
     Ok(())
 }
 
-#[allow(clippy::await_holding_lock)]
 /// Consume events until a single action is produced.
 /// This function is used to consume events until a single action is produced
 /// from a map of events to actions.
@@ -382,36 +383,34 @@ fn fold_chat_list_refresh_actions(actions: Vec<Action>) -> Vec<Action> {
         return actions;
     }
     let mut out = Vec::with_capacity(actions.len());
-    let mut i = 0;
-    while i < actions.len() {
-        if matches!(actions[i], Action::ChatHistoryAppended | Action::Refresh) {
-            let mut saw_refresh = false;
-            let mut saw_cha = false;
-            while i < actions.len()
-                && matches!(actions[i], Action::ChatHistoryAppended | Action::Refresh)
-            {
-                match &actions[i] {
-                    Action::Refresh => saw_refresh = true,
-                    Action::ChatHistoryAppended => saw_cha = true,
-                    _ => {}
-                }
-                i += 1;
+    let mut iter = actions.into_iter().peekable();
+    while let Some(action) = iter.next() {
+        if !matches!(action, Action::ChatHistoryAppended | Action::Refresh) {
+            // Move through untouched: cloning here would copy sign-in secrets.
+            out.push(action);
+            continue;
+        }
+        let mut saw_refresh = matches!(action, Action::Refresh);
+        let mut saw_cha = !saw_refresh;
+        while matches!(
+            iter.peek(),
+            Some(Action::ChatHistoryAppended | Action::Refresh)
+        ) {
+            match iter.next() {
+                Some(Action::Refresh) => saw_refresh = true,
+                _ => saw_cha = true,
             }
-            if saw_refresh {
-                out.push(Action::Refresh);
-            }
-            if saw_cha {
-                out.push(Action::ChatHistoryAppended);
-            }
-        } else {
-            out.push(actions[i].clone());
-            i += 1;
+        }
+        if saw_refresh {
+            out.push(Action::Refresh);
+        }
+        if saw_cha {
+            out.push(Action::ChatHistoryAppended);
         }
     }
     out
 }
 
-/// Returns true for actions that change UI-visible state and should trigger a render.
 fn action_changes_ui(action: &Action) -> bool {
     matches!(
         action,
@@ -477,13 +476,6 @@ fn action_changes_ui(action: &Action) -> bool {
             | Action::UpdateArea(_)
             | Action::GetChatHistoryNewer
             | Action::ChatHistoryAppended
-            | Action::LoginSelectQr
-            | Action::LoginSubmitPhone(_)
-            | Action::LoginSubmitCode(_)
-            | Action::LoginSubmitPassword(_)
-            | Action::LoginSubmitEmail(_)
-            | Action::LoginSubmitEmailCode(_)
-            | Action::LoginSubmitRegistration { .. }
             | Action::LoginFailed(_)
     )
 }
@@ -496,7 +488,6 @@ fn action_changes_ui(action: &Action) -> bool {
 /// ([`TgBackend::submit_login`]) without blocking this turn or cloning secrets
 /// across components. [`crate::tg::tg_context::TgContext`] mutexes are not held across
 /// `.await` in the [`Action::GetChatHistory`] path (loads use discrete lock regions per batch).
-#[allow(clippy::await_holding_lock)]
 ///
 /// # Arguments
 /// * `app_context` - An Arc wrapped AppContext struct.
@@ -533,8 +524,8 @@ pub async fn handle_app_actions(
     }
 
     for action in folded {
-        // Sign-in submissions move once into the background TDLib task and never
-        // fan out to every component; failures return as LoginFailed.
+        // Sign-in submissions move into the background TDLib task; failures return
+        // as LoginFailed, which still fans out below so the card can show the error.
         if matches!(
             action,
             Action::LoginSelectQr
@@ -680,7 +671,7 @@ pub async fn handle_app_actions(
 
                     let tg = app_context.tg_context();
                     loaded_count += entries.len();
-                    tg.open_chat_messages().insert_messages(entries.clone());
+                    tg.open_chat_messages().insert_messages(entries);
                 }
 
                 app_context.tg_context().set_history_loading(false);
@@ -1076,7 +1067,7 @@ pub async fn handle_app_actions(
         if action_changes_ui(&action) {
             app_context.mark_dirty();
         }
-        tui.update(action.clone())
+        tui.update(action)
     }
 
     if raw_len >= 32 {
@@ -1102,7 +1093,6 @@ enum HandleCliOutcome {
     Logout,
 }
 
-#[allow(clippy::await_holding_lock)]
 /// Handle the command line arguments.
 /// This function will handle the command line arguments.
 ///
@@ -1111,18 +1101,24 @@ enum HandleCliOutcome {
 /// * `tui_backend` - A mutable reference to the TuiBackend struct.
 /// * `tg_backend` - A mutable reference to the TgBackend struct.
 async fn handle_cli(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) -> HandleCliOutcome {
-    if app_context.cli_args().telegram_cli().logout() {
+    // Snapshot CLI state while the guard is held; a parking_lot guard must
+    // never live through the network awaits below.
+    let (logout, send_request) = {
+        let args = app_context.cli_args();
+        let telegram = args.telegram_cli();
+        (telegram.logout(), telegram.send_message().cloned())
+    };
+    if logout {
         return HandleCliOutcome::Logout;
     }
-    if let Some(chat) = app_context.cli_args().telegram_cli().send_message() {
-        futures::join!(tg_backend.load_all_chats());
-
-        let [chat_name, message_text] = chat.as_slice() else {
+    if let Some(chat) = send_request {
+        let Ok([chat_name, message_text]) = <[String; 2]>::try_from(chat) else {
             tracing::error!("Invalid number of arguments for send message");
             println!("Invalid number of arguments for send message");
             return HandleCliOutcome::Quit;
         };
-        match tg_backend.search_chats(chat_name.to_string()).await {
+        tg_backend.load_all_chats().await;
+        match tg_backend.search_chats(chat_name.clone()).await {
             Ok(chat) => {
                 tracing::info!("Chat found: {:?}", chat);
                 let total_chats = chat.total_count;
@@ -1139,7 +1135,7 @@ async fn handle_cli(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) ->
                 }
                 let chat_id = chats_vec[0];
                 let msg = tg_backend
-                    .send_message(message_text.to_string(), chat_id, None)
+                    .send_message(message_text.clone(), chat_id, None)
                     .await;
                 match msg {
                     Ok(msg) => {
@@ -1193,7 +1189,8 @@ async fn handle_cli(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) ->
 /// * `tui_backend` - A mutable reference to the TuiBackend struct.
 async fn quit_tui(tg_backend: &mut TgBackend, tui_backend: &mut TuiBackend) {
     tui_backend.exit();
-    if matches!(tg_backend.app_context.td_auth(), TdAuth::Ready) {
+    let ready = matches!(*tg_backend.app_context.td_auth(), TdAuth::Ready);
+    if ready {
         tg_backend.offline().await;
     }
     tg_backend.close().await;

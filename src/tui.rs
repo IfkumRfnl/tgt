@@ -24,7 +24,7 @@ pub struct Tui {
 
 impl Tui {
     pub fn new(app_context: Arc<AppContext>) -> Self {
-        let components_iter: Vec<(ComponentName, Box<dyn Component>)> = vec![
+        let components: [(ComponentName, Box<dyn Component>); 3] = [
             (
                 ComponentName::TitleBar,
                 TitleBar::new(Arc::clone(&app_context))
@@ -44,14 +44,12 @@ impl Tui {
                     .new_boxed(),
             ),
         ];
-        let components: HashMap<ComponentName, Box<dyn Component>> =
-            components_iter.into_iter().collect();
 
         let login = LoginWindow::new(Arc::clone(&app_context));
 
         Tui {
             app_context,
-            components,
+            components: HashMap::from(components),
             login,
         }
     }
@@ -61,8 +59,8 @@ impl Tui {
         tx: UnboundedSender<Action>,
     ) -> Result<(), AppError<Action>> {
         self.components
-            .iter_mut()
-            .try_for_each(|(_, component)| component.register_action_handler(tx.clone()))?;
+            .values_mut()
+            .try_for_each(|component| component.register_action_handler(tx.clone()))?;
         Ok(())
     }
 
@@ -73,22 +71,20 @@ impl Tui {
         if self.app_context.focused_component() == Some(ComponentName::Login) {
             return self.login.handle_events(event);
         }
-        self.components
-            .get_mut(&ComponentName::CoreWindow)
-            .unwrap()
-            .handle_events(event.clone())
+        self.component(&ComponentName::CoreWindow)
+            .handle_events(event)
     }
 
     pub fn update(&mut self, action: Action) {
         // The status bar also reads the area, so every component sees the action.
         self.login.update(action.clone());
         self.components
-            .iter_mut()
-            .for_each(|(_, component)| component.update(action.clone()));
+            .values_mut()
+            .for_each(|component| component.update(action.clone()));
     }
 
     pub fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> Result<(), AppError<()>> {
-        if !matches!(self.app_context.td_auth(), TdAuth::Ready) {
+        if !matches!(*self.app_context.td_auth(), TdAuth::Ready) {
             self.login.draw(frame, area)?;
             return Ok(());
         }
