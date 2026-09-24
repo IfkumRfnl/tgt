@@ -72,6 +72,23 @@ After the installation, you can run `tgt` with the following command:
 tgt --help
 ```
 
+### Signing in
+
+Run `tgt` without arguments to sign in. Use the arrow keys and Enter to choose
+QR-code or phone-number login.
+
+- **QR code:** In Telegram on your phone, open **Settings → Devices → Link Desktop
+  Device** and scan the terminal. Codes refresh automatically. Enlarge the terminal
+  if the code cannot fit; login links are encoded locally, not sent to a QR service.
+- **Phone number:** Include your country code, then enter the verification code
+  Telegram sends. Escape returns from the phone-number field to the menu before
+  submission.
+- Telegram may also ask for your cloud password, email verification, or account
+  name. Password input is masked. **Ctrl+C** exits any sign-in step.
+
+CLI commands that require a session do not prompt for credentials. Sign in with
+`tgt` first, then retry the command.
+
 ### Features
 
 Build features can be combined (e.g. `cargo build --release --features download-tdlib,chafa-dyn`).

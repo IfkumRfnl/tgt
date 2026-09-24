@@ -14,29 +14,15 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// `Tui` is a struct that represents the main user interface for the
-/// application. It is responsible for managing the layout and rendering of all
-/// the components. It also handles the distribution of events and actions to
-/// the appropriate components.
+/// Main interface. Draws the sign-in card instead of the chat shell until
+/// TDLib reports [`TdAuth::Ready`], and routes events to the focused side.
 pub struct Tui {
-    /// The application configuration.
     app_context: Arc<AppContext>,
-    /// An optional unbounded sender that can send actions to be processed.
-    action_tx: Option<UnboundedSender<Action>>,
-    /// A hashmap of components that make up the user interface.
     components: HashMap<ComponentName, Box<dyn Component>>,
-    /// Sign-in card. Drawn instead of the chat shell until TDLib is ready.
     login: LoginWindow,
 }
-/// Implement the `Tui` struct.
+
 impl Tui {
-    /// Create a new instance of the `Tui` struct.
-    ///
-    /// # Arguments
-    /// * `app_context` - An Arc wrapped AppContext struct.
-    ///
-    /// # Returns
-    /// * `Self` - The new instance of the `Tui` struct.
     pub fn new(app_context: Arc<AppContext>) -> Self {
         let components_iter: Vec<(ComponentName, Box<dyn Component>)> = vec![
             (
@@ -58,46 +44,28 @@ impl Tui {
                     .new_boxed(),
             ),
         ];
-        let action_tx = None;
         let components: HashMap<ComponentName, Box<dyn Component>> =
             components_iter.into_iter().collect();
 
         let login = LoginWindow::new(Arc::clone(&app_context));
 
         Tui {
-            action_tx,
-            components,
             app_context,
+            components,
             login,
         }
     }
-    /// Register an action handler that can send actions for processing if
-    /// necessary.
-    ///
-    /// # Arguments
-    /// * `tx` - An unbounded sender that can send actions.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<()>` - An Ok result or an error.
+
     pub fn register_action_handler(
         &mut self,
         tx: UnboundedSender<Action>,
     ) -> Result<(), AppError<Action>> {
-        self.action_tx = Some(tx.clone());
         self.components
             .iter_mut()
             .try_for_each(|(_, component)| component.register_action_handler(tx.clone()))?;
         Ok(())
     }
-    /// Handle incoming events and produce actions if necessary.
-    ///
-    /// # Arguments
-    /// * `event` - An optional event to be processed.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Option<Action>>` - An action to be processed or none.
+
     pub fn handle_events(
         &mut self,
         event: Option<Event>,
@@ -110,36 +78,24 @@ impl Tui {
             .unwrap()
             .handle_events(event.clone())
     }
-    /// Update the state of the component based on a received action.
-    ///
-    /// # Arguments
-    ///
-    /// * `action` - An action that may modify the state of the component.
+
     pub fn update(&mut self, action: Action) {
-        // We can not send the action only to the `CoreWindow` component because
-        // the `StatusBar` component needs to know the area to render the size.
+        // The status bar also reads the area, so every component sees the action.
         self.login.update(action.clone());
         self.components
             .iter_mut()
             .for_each(|(_, component)| component.update(action.clone()));
     }
-    /// Render the user interface to the screen.
-    ///
-    /// # Arguments
-    /// * `frame` - A mutable reference to the frame to be rendered.
-    /// * `area` - A rectangular area to render the user interface within.
-    ///
-    /// # Returns
-    /// * `Result<()>` - An Ok result or an error.
+
     pub fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> Result<(), AppError<()>> {
         if !matches!(self.app_context.td_auth(), TdAuth::Ready) {
             self.login.draw(frame, area)?;
             return Ok(());
         }
+        // The card stops drawing from here on; wipe its buffers and QR cache.
+        self.login.clear_secrets();
 
-        self.components
-            .get_mut(&ComponentName::StatusBar)
-            .unwrap()
+        self.component(&ComponentName::StatusBar)
             .update(Action::UpdateArea(area));
 
         let core_window: &mut dyn std::any::Any =
@@ -174,30 +130,20 @@ impl Tui {
         )
         .split(area);
 
-        self.components
-            .get_mut(&ComponentName::TitleBar)
-            .unwrap_or_else(|| {
-                tracing::error!("Failed to get component: {}", ComponentName::TitleBar);
-                panic!("Failed to get component: {}", ComponentName::TitleBar)
-            })
+        self.component(&ComponentName::TitleBar)
             .draw(frame, main_layout[0])?;
-
-        self.components
-            .get_mut(&ComponentName::CoreWindow)
-            .unwrap_or_else(|| {
-                tracing::error!("Failed to get component: {}", ComponentName::CoreWindow);
-                panic!("Failed to get component: {}", ComponentName::CoreWindow)
-            })
+        self.component(&ComponentName::CoreWindow)
             .draw(frame, main_layout[1])?;
-
-        self.components
-            .get_mut(&ComponentName::StatusBar)
-            .unwrap_or_else(|| {
-                tracing::error!("Failed to get component: {}", ComponentName::StatusBar);
-                panic!("Failed to get component: {}", ComponentName::StatusBar)
-            })
+        self.component(&ComponentName::StatusBar)
             .draw(frame, main_layout[2])?;
 
         Ok(())
+    }
+
+    fn component(&mut self, name: &ComponentName) -> &mut Box<dyn Component> {
+        self.components.get_mut(name).unwrap_or_else(|| {
+            tracing::error!("Failed to get component: {}", name);
+            panic!("Failed to get component: {}", name)
+        })
     }
 }

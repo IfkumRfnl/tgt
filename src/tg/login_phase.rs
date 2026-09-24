@@ -1,10 +1,7 @@
 use tdlib_rs::enums::AuthorizationState;
 
-/// What TDLib last reported about authorization.
-///
-/// The login card does not store this. Keystrokes live on the widget. The link
-/// sits on [`TdAuth::WaitOtherDevice`] because that is the update that carries it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Authorization state needed by the sign-in screen.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum TdAuth {
     /// Parameters have not been applied yet.
     #[default]
@@ -25,6 +22,23 @@ pub enum TdAuth {
     WaitRegistration,
     /// Session is authorized.
     Ready,
+}
+
+// Authorization links are credentials; AppContext's Debug must not expose them.
+impl std::fmt::Debug for TdAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Starting => "Starting",
+            Self::WaitPhoneNumber => "WaitPhoneNumber",
+            Self::WaitOtherDevice { .. } => "WaitOtherDevice { link: [redacted] }",
+            Self::WaitCode => "WaitCode",
+            Self::WaitPassword => "WaitPassword",
+            Self::WaitEmail => "WaitEmail",
+            Self::WaitEmailCode => "WaitEmailCode",
+            Self::WaitRegistration => "WaitRegistration",
+            Self::Ready => "Ready",
+        })
+    }
 }
 
 impl TdAuth {
@@ -59,33 +73,14 @@ impl TdAuth {
 #[cfg(test)]
 mod tests {
     use super::TdAuth;
-    use tdlib_rs::enums::AuthorizationState;
-    use tdlib_rs::types::AuthorizationStateWaitOtherDeviceConfirmation;
 
     #[test]
-    fn phone_wait_has_no_payload() {
-        let auth = TdAuth::from_authorization_state(&AuthorizationState::WaitPhoneNumber);
-        assert_eq!(auth, Some(TdAuth::WaitPhoneNumber));
-    }
-
-    #[test]
-    fn other_device_keeps_the_link() {
-        let state = AuthorizationState::WaitOtherDeviceConfirmation(
-            AuthorizationStateWaitOtherDeviceConfirmation {
-                link: "tg://login?token=abc".into(),
-            },
-        );
-        assert_eq!(
-            TdAuth::from_authorization_state(&state),
-            Some(TdAuth::WaitOtherDevice {
-                link: "tg://login?token=abc".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn ready_is_not_a_user_step() {
-        let auth = TdAuth::from_authorization_state(&AuthorizationState::Ready).unwrap();
-        assert!(!auth.needs_user());
+    fn debug_does_not_expose_login_credentials() {
+        let auth = TdAuth::WaitOtherDevice {
+            link: "tg://login?token=secret".into(),
+        };
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("tg://"));
     }
 }

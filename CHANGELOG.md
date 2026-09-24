@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Added
 
+- In-terminal sign-in menu with phone-number and locally rendered QR-code login; rotating QR tokens update without blocking terminal input.
 - `static` feature to statically link `tdjson` (use with `download-tdlib` or `local-tdlib`); no runtime `tdjson` dependency needed. Powered by **tdlib-rs v1.4.0**.
 - CI: `static` feature combinations (`local-tdlib,static`, `download-tdlib,static`) in Linux, macOS, and Windows workflows.
 - CI: Android cross-compilation workflow (`aarch64-linux-android`, `x86_64-linux-android`) with static linking.
@@ -34,6 +35,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Fixed
 
+- QR login keeps its scanner quiet zone when resized, avoids logging login links, and clears credentials when authorization finishes.
 - Stack overflow in the prompt when wrapping at the window edge (`insert_newline` no longer recurses through `insert('\n')`).
 - Occasional startup hangs and chat list refresh hangs.
 - Chat search reliability and clearer failure feedback via the status bar.

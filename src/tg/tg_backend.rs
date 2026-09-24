@@ -20,16 +20,6 @@ use super::login_phase::TdAuth;
 use super::message_entry::MessageEntry;
 use super::td_enums::TdMessageReplyToMessage;
 
-/// Result of applying one TDLib authorization update.
-pub enum AppliedAuth {
-    /// The sign-in card should show this step.
-    Phase(TdAuth),
-    /// TDLib closed the client.
-    Closed,
-    /// Parameters, logout, or another state that does not change the card.
-    Unchanged,
-}
-
 /// Fetches one or more batches of chat history (for background task). Does not hold any app locks.
 pub async fn fetch_chat_history_background(
     client_id: i32,
@@ -79,7 +69,6 @@ pub struct TgBackend {
     pub event_rx: UnboundedReceiver<Event>,
     pub event_tx: UnboundedSender<Event>,
     pub client_id: i32,
-    pub have_authorization: bool,
     pub can_quit: Arc<AtomicBool>,
     pub app_context: Arc<AppContext>,
     full_chats_list: bool,
@@ -92,7 +81,6 @@ impl TgBackend {
         let (auth_tx, auth_rx) = tokio::sync::mpsc::unbounded_channel::<AuthorizationState>();
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let client_id = tdlib_rs::create_client();
-        let have_authorization = false;
         let can_quit = Arc::new(AtomicBool::new(false));
         let full_chats_list = false;
         app_context.tg_context().set_event_tx(event_tx.clone());
@@ -105,7 +93,6 @@ impl TgBackend {
             event_tx,
             event_rx,
             client_id,
-            have_authorization,
             can_quit,
             app_context,
             full_chats_list,
@@ -601,74 +588,56 @@ impl TgBackend {
         }
     }
 
-    /// Apply one authorization update.
-    ///
-    /// States that need no typing are handled here. States that need the sign-in
-    /// card are returned as [`AppliedAuth::Phase`] and are not prompted on stdin.
-    pub async fn apply_auth_update(&mut self, state: AuthorizationState) -> AppliedAuth {
-        if let AuthorizationState::WaitOtherDeviceConfirmation(confirmation) = &state {
-            tracing::info!(link = %confirmation.link, "qr login link");
-        }
-        if matches!(state, AuthorizationState::Ready) {
-            self.have_authorization = true;
-        }
+    /// Apply an authorization update; return true when the client has closed.
+    pub async fn apply_auth_state(
+        &mut self,
+        state: AuthorizationState,
+    ) -> Result<bool, tdlib_rs::types::Error> {
         if let Some(auth) = TdAuth::from_authorization_state(&state) {
-            return AppliedAuth::Phase(auth);
+            if matches!(state, AuthorizationState::Ready) {
+                tracing::info!("TDLib authorization ready");
+            } else {
+                tracing::debug!("TDLib authorization step");
+            }
+            self.app_context.set_td_auth(auth);
+            return Ok(false);
         }
-        match state {
+        Ok(match state {
             AuthorizationState::WaitTdlibParameters => {
-                if let Err(error) = self.apply_tdlib_parameters().await {
-                    tracing::error!("Failed to set TDLib parameters: {}", error.message);
-                }
-                AppliedAuth::Unchanged
+                self.apply_tdlib_parameters().await?;
+                false
             }
             AuthorizationState::LoggingOut => {
-                self.have_authorization = false;
                 tracing::info!("Logging out");
-                AppliedAuth::Unchanged
+                self.app_context.set_td_auth(TdAuth::Starting);
+                false
             }
             AuthorizationState::Closing => {
-                self.have_authorization = false;
                 tracing::info!("Closing");
-                AppliedAuth::Unchanged
+                self.app_context.set_td_auth(TdAuth::Starting);
+                false
             }
             AuthorizationState::Closed => {
                 tracing::info!("Closed");
+                self.app_context.set_td_auth(TdAuth::Starting);
                 self.can_quit.store(true, Ordering::Release);
-                AppliedAuth::Closed
+                true
             }
             AuthorizationState::WaitPremiumPurchase(_) => {
                 tracing::info!("Waiting for premium purchase confirmation");
-                AppliedAuth::Unchanged
+                false
             }
-            _ => AppliedAuth::Unchanged,
-        }
+            _ => false,
+        })
     }
 
-    /// Read every authorization update already queued.
-    pub async fn poll_auth(&mut self) -> Vec<AppliedAuth> {
-        let mut updates = Vec::new();
-        while let Ok(state) = self.auth_rx.try_recv() {
-            updates.push(self.apply_auth_update(state).await);
-        }
-        updates
-    }
-
-    /// Block until the next authorization update arrives.
-    pub async fn recv_auth(&mut self) -> Option<AppliedAuth> {
-        let state = self.auth_rx.recv().await?;
-        Some(self.apply_auth_update(state).await)
-    }
-
-    /// Wait until TDLib reports that the client is closed.
+    /// Keep receiving until TDLib closes, bounded in case the client stops responding.
     pub async fn drain_until_closed(&mut self) {
+        if self.can_quit.load(Ordering::Acquire) {
+            return;
+        }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!("Timed out waiting for TDLib to close");
-                self.can_quit.store(true, Ordering::Release);
-                break;
-            }
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
                     tracing::warn!("Timed out waiting for TDLib to close");
@@ -680,7 +649,9 @@ impl TgBackend {
                         self.can_quit.store(true, Ordering::Release);
                         break;
                     };
-                    if matches!(self.apply_auth_update(state).await, AppliedAuth::Closed) {
+                    if matches!(state, AuthorizationState::Closed) {
+                        self.app_context.set_td_auth(TdAuth::Starting);
+                        self.can_quit.store(true, Ordering::Release);
                         break;
                     }
                 }
@@ -688,40 +659,57 @@ impl TgBackend {
         }
     }
 
-    /// Send one sign-in step. The next authorization update moves the card.
-    pub async fn submit_login(&self, action: &Action) -> Result<(), tdlib_rs::types::Error> {
+    /// Submit without blocking input or QR rotation; report failures on the action queue.
+    pub fn submit_login(&self, action: Action) {
         let client_id = self.client_id;
-        match action {
-            Action::LoginSelectQr => {
-                functions::request_qr_code_authentication(Vec::new(), client_id).await?;
-            }
-            Action::LoginSubmitPhone(phone) => {
-                functions::set_authentication_phone_number(phone.clone(), None, client_id).await?;
-            }
-            Action::LoginSubmitCode(code) => {
-                functions::check_authentication_code(code.clone(), client_id).await?;
-            }
-            Action::LoginSubmitPassword(password) => {
-                functions::check_authentication_password(password.clone(), client_id).await?;
-            }
-            Action::LoginSubmitEmail(email) => {
-                functions::set_authentication_email_address(email.clone(), client_id).await?;
-            }
-            Action::LoginSubmitEmailCode(code) => {
-                functions::check_authentication_email_code(
+        let action_tx = self.app_context.action_tx().clone();
+        tokio::spawn(async move {
+            let result: Result<(), tdlib_rs::types::Error> = match action {
+                Action::LoginSelectQr => {
+                    functions::request_qr_code_authentication(Vec::new(), client_id)
+                        .await
+                        .map(|_| ())
+                }
+                Action::LoginSubmitPhone(phone) => {
+                    functions::set_authentication_phone_number(phone, None, client_id)
+                        .await
+                        .map(|_| ())
+                }
+                Action::LoginSubmitCode(code) => {
+                    functions::check_authentication_code(code, client_id)
+                        .await
+                        .map(|_| ())
+                }
+                Action::LoginSubmitPassword(password) => {
+                    functions::check_authentication_password(password, client_id)
+                        .await
+                        .map(|_| ())
+                }
+                Action::LoginSubmitEmail(email) => {
+                    functions::set_authentication_email_address(email, client_id)
+                        .await
+                        .map(|_| ())
+                }
+                Action::LoginSubmitEmailCode(code) => functions::check_authentication_email_code(
                     enums::EmailAddressAuthentication::Code(
-                        tdlib_rs::types::EmailAddressAuthenticationCode { code: code.clone() },
+                        tdlib_rs::types::EmailAddressAuthenticationCode { code },
                     ),
                     client_id,
                 )
-                .await?;
+                .await
+                .map(|_| ()),
+                Action::LoginSubmitRegistration { first, last } => {
+                    functions::register_user(first, last, false, client_id)
+                        .await
+                        .map(|_| ())
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                tracing::error!("sign-in request failed: {}", error.message);
+                let _ = action_tx.send(Action::LoginFailed(error.message));
             }
-            Action::LoginSubmitRegistration { first, last } => {
-                functions::register_user(first.clone(), last.clone(), false, client_id).await?;
-            }
-            _ => {}
-        }
-        Ok(())
+        });
     }
 
     async fn apply_tdlib_parameters(&self) -> Result<(), tdlib_rs::types::Error> {
@@ -873,6 +861,7 @@ impl TgBackend {
         let can_quit = self.can_quit.clone();
         let tg_context = self.app_context.tg_context();
         let action_tx = self.app_context.action_tx().clone();
+        let own_client_id = self.client_id;
 
         self.handle_updates = tokio::spawn(async move {
             tracing::info!("Starting handling updates from TDLib");
@@ -884,7 +873,10 @@ impl TgBackend {
             while !can_quit.load(Ordering::Acquire) {
                 let mut update_dequeue: VecDeque<Update> = VecDeque::new();
                 match tdlib_rs::receive() {
-                    Some((update, _client_id)) => {
+                    Some((update, client_id)) => {
+                        if client_id != own_client_id {
+                            continue;
+                        }
                         update_dequeue.push_back(update);
                         let update = update_dequeue.pop_front().unwrap();
                         match update.clone() {
@@ -896,7 +888,9 @@ impl TgBackend {
                                     .set_last_acknowledged_message_id(update_message.message_id);
                             }
                             Update::AuthorizationState(update) => {
-                                auth_tx.send(update.authorization_state).unwrap();
+                                if auth_tx.send(update.authorization_state).is_err() {
+                                    return;
+                                }
                                 let _ = wake_tx.send(());
                             }
                             Update::User(update_user) => {
