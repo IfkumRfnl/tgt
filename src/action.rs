@@ -452,6 +452,7 @@ impl FromStr for Action {
 #[cfg(test)]
 mod login_request_tests {
     use super::{Action, LoginRequest};
+    use crate::tg::login_phase::TdAuth;
 
     #[test]
     fn debug_redacts_every_credential() {
@@ -480,5 +481,11 @@ mod login_request_tests {
                 assert!(!debug.contains(secret), "{debug} leaks {secret}");
             }
         }
+        let auth = TdAuth::WaitOtherDevice {
+            link: "tg://login?token=secret".into(),
+        };
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("tg://"));
     }
 }

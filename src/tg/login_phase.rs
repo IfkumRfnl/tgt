@@ -45,18 +45,3 @@ impl TdAuth {
         !matches!(self, Self::Starting | Self::Ready)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::TdAuth;
-
-    #[test]
-    fn debug_does_not_expose_login_credentials() {
-        let auth = TdAuth::WaitOtherDevice {
-            link: "tg://login?token=secret".into(),
-        };
-        let debug = format!("{auth:?}");
-        assert!(!debug.contains("secret"));
-        assert!(!debug.contains("tg://"));
-    }
-}

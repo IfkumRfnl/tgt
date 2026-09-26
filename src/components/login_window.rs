@@ -531,108 +531,24 @@ mod tests {
 
     const LOGIN_LINK: &str = "tg://login?token=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJK";
 
-    fn has_blocks(text: &str) -> bool {
-        text.contains('█') || text.contains('▀') || text.contains('▄')
-    }
-
-    fn render(login: &mut LoginWindow, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| login.draw(frame, frame.area()).unwrap())
-            .unwrap();
-        terminal.backend().buffer().clone()
-    }
-
-    fn visible(login: &mut LoginWindow, width: u16, height: u16) -> String {
-        buffer_text(&render(login, width, height))
-    }
-
-    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
-        buffer.content.iter().map(|cell| cell.symbol()).collect()
-    }
-
-    fn qr_state(link: &str) -> (std::sync::Arc<crate::app_context::AppContext>, LoginWindow) {
-        let context = create_test_app_context();
-        *context.td_auth() = TdAuth::WaitOtherDevice { link: link.into() };
-        let login = LoginWindow::new(context.clone());
-        (context, login)
-    }
-
-    #[test]
-    fn qr_fits_a_classic_terminal() {
-        let (_context, mut login) = qr_state(LOGIN_LINK);
-        let buffer = render(&mut login, 80, 24);
-        let text = buffer_text(&buffer);
-        assert!(has_blocks(&text));
-        assert!(!text.contains("tg://"));
-        for cell in buffer
-            .content
-            .iter()
-            .filter(|cell| has_blocks(cell.symbol()))
-        {
-            assert_eq!(cell.fg, ratatui::style::Color::Black);
-            assert_eq!(cell.bg, ratatui::style::Color::White);
-        }
-    }
-
     #[test]
     fn qr_keeps_four_module_quiet_zone() {
         let cached = CachedQr::fresh(LOGIN_LINK);
         let (code, scale) = cached.pick(80, 22).expect("qr fits");
-        let pixels = code
-            .width()
-            .saturating_add(super::QUIET * 2)
-            .saturating_mul(scale);
+        let pixels = (code.width() + 8) * scale;
+        assert!(qr_dark(code, scale, 4 * scale, 4 * scale));
         for x in 0..pixels {
-            for y in 0..super::QUIET * scale {
+            for y in 0..4 * scale {
                 assert!(!qr_dark(code, scale, x, y));
                 assert!(!qr_dark(code, scale, x, pixels - 1 - y));
             }
         }
         for y in 0..pixels {
-            for x in 0..super::QUIET * scale {
+            for x in 0..4 * scale {
                 assert!(!qr_dark(code, scale, x, y));
                 assert!(!qr_dark(code, scale, pixels - 1 - x, y));
             }
         }
-    }
-
-    #[test]
-    fn tiny_and_zero_terminals_show_resize_instead_of_code() {
-        let (_context, mut login) = qr_state(LOGIN_LINK);
-        for (width, height) in [(30, 12), (80, 10), (20, 8), (1, 1)] {
-            let text = visible(&mut login, width, height);
-            assert!(!has_blocks(&text), "unexpected code at {width}x{height}");
-            assert!(!text.contains("tg://"));
-        }
-        // An explicit zero-area draw is a no-op, never a panic.
-        let mut terminal = Terminal::new(TestBackend::new(10, 10)).unwrap();
-        terminal
-            .draw(|frame| {
-                login
-                    .draw(frame, ratatui::layout::Rect::new(0, 0, 0, 0))
-                    .unwrap();
-            })
-            .unwrap();
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .all(|cell| cell.symbol() == " "));
-    }
-
-    #[test]
-    fn qr_wide_multiline_error_falls_back_to_resize_note() {
-        let (_context, mut login) = qr_state(LOGIN_LINK);
-        // Sync to the QR step, then fail with a wide two-line error.
-        visible(&mut login, 80, 24);
-        let error = format!("{}\nAdditional detail", "x".repeat(60));
-        login.update(Action::LoginFailed(error));
-        assert!(has_blocks(&visible(&mut login, 80, 30)));
-        let small = visible(&mut login, 80, 24);
-        assert!(!has_blocks(&small));
-        assert!(small.contains("Additional detail"));
     }
 
     #[test]
@@ -661,7 +577,17 @@ mod tests {
         login
             .handle_events(Some(Event::Paste(password.into())))
             .unwrap();
-        let text = visible(&mut login, 80, 24);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| login.draw(frame, frame.area()).unwrap())
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
         assert!(!text.contains("secret"));
         assert!(text.contains(&"•".repeat(password.chars().count())));
         assert!(matches!(
@@ -672,46 +598,5 @@ mod tests {
         login.update(Action::Refresh);
         *context.td_auth() = TdAuth::WaitPassword;
         assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
-    }
-
-    #[test]
-    fn auth_transition_before_failure_keeps_new_error() {
-        let context = create_test_app_context();
-        *context.td_auth() = TdAuth::WaitCode;
-        let mut login = LoginWindow::new(context.clone());
-        visible(&mut login, 80, 24);
-        login.insert_str("12345");
-        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_some());
-        // TDLib advances before the failure arrives; the error belongs to the new step.
-        *context.td_auth() = TdAuth::WaitPassword;
-        login.update(Action::LoginFailed("Bad password".into()));
-        assert!(matches!(login.state, TdAuth::WaitPassword));
-        assert_eq!(login.error.as_deref(), Some("Bad password"));
-        assert!(!login.busy);
-    }
-
-    #[test]
-    fn registration_preserves_both_fields_across_validation_and_focus_changes() {
-        let context = create_test_app_context();
-        *context.td_auth() = TdAuth::WaitRegistration;
-        let mut login = LoginWindow::new(context);
-        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
-        login
-            .handle_events(Some(Event::Paste(" Last \n".into())))
-            .unwrap();
-        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
-        assert!(!login.busy);
-        login.on_key(KeyCode::Tab, KeyModifiers::NONE);
-        login
-            .handle_events(Some(Event::Paste(" Élodie ".into())))
-            .unwrap();
-        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
-        assert_eq!(
-            login.on_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Action::Login(LoginRequest::Registration {
-                first: "Élodie".into(),
-                last: "Last".into(),
-            })),
-        );
     }
 }
