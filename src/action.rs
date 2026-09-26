@@ -107,15 +107,7 @@ pub enum LoginRequest {
 // Login secrets must not reach logs; mirror `TdAuth`'s redaction.
 impl std::fmt::Debug for LoginRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Qr => "Qr",
-            Self::Phone(_) => "Phone([redacted])",
-            Self::Code(_) => "Code([redacted])",
-            Self::Password(_) => "Password([redacted])",
-            Self::Email(_) => "Email([redacted])",
-            Self::EmailCode(_) => "EmailCode([redacted])",
-            Self::Registration { .. } => "Registration { first: [redacted], last: [redacted] }",
-        })
+        f.write_str("LoginRequest([redacted])")
     }
 }
 
