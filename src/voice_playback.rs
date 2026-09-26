@@ -26,7 +26,7 @@ pub enum VoicePlaybackCommand {
 }
 
 /// Spawns the playback thread and returns the command sender.
-/// Returns None if the audio output stream could not be opened (e.g. no ALSA on Linux ARM).
+/// Returns None if audio initialization fails or does not finish within two seconds.
 /// Sink handle and player are created inside the thread (rodio MixerDeviceSink is not Send).
 /// `wake_tx`: signalled when position (or other UI) is updated so the main loop can redraw immediately.
 pub fn spawn_playback_thread(
@@ -35,6 +35,7 @@ pub fn spawn_playback_thread(
 ) -> Option<std::sync::mpsc::Sender<VoicePlaybackCommand>> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
 
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let sink_handle = match rodio::DeviceSinkBuilder::open_default_sink() {
             Ok(h) => h,
@@ -44,10 +45,12 @@ pub fn spawn_playback_thread(
                 return;
             }
         };
-        run_playback_loop(cmd_rx, sink_handle, action_tx, wake_tx);
+        if ready_tx.send(cmd_tx).is_ok() {
+            run_playback_loop(cmd_rx, sink_handle, action_tx, wake_tx);
+        }
     });
-
-    Some(cmd_tx)
+    // Keep device-probe warnings off the alternate screen when initialization is prompt.
+    ready_rx.recv_timeout(Duration::from_secs(2)).ok()
 }
 
 fn run_playback_loop(

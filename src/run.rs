@@ -1,8 +1,13 @@
-use crate::component_name::ComponentName::Prompt;
+use crate::component_name::ComponentName::{self, Prompt};
 use crate::{
-    action::Action, app_context::AppContext, app_error::AppError,
-    configs::custom::keymap_custom::ActionBinding, event::Event, tg::tg_backend::TgBackend,
-    tui::Tui, tui_backend::TuiBackend,
+    action::Action,
+    app_context::AppContext,
+    app_error::AppError,
+    configs::custom::keymap_custom::ActionBinding,
+    event::Event,
+    tg::{login_phase::TdAuth, tg_backend::TgBackend},
+    tui::Tui,
+    tui_backend::TuiBackend,
 };
 use ratatui::layout::Rect;
 use std::{collections::HashMap, io, sync::Arc, time::Duration, time::Instant};
@@ -28,40 +33,16 @@ pub async fn run_app(
 ) -> Result<(), AppError<Action>> {
     tracing::info!("Starting run_app");
 
-    // Clear the terminal and move the cursor to the top left corner
-    io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
-
     // Wake channel for TG: when a new message (or other UI event) is pushed, we wake the main loop immediately.
     let (tg_wake_tx, mut tg_wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     tg_backend.start(tg_wake_tx);
     tg_backend.set_logging().await;
-    tg_backend.handle_authorization_state().await;
-    tg_backend.use_quick_ack().await;
-    tg_backend.get_me().await;
-    // On startup, fetch a larger chunk of the main chat list so the UI reaches a "latest state"
-    // quickly and doesn't feel like it's incrementally catching up for a long time.
-    tg_backend.load_chats(ChatList::Main, 200).await;
 
-    match handle_cli(Arc::clone(&app_context), tg_backend).await {
-        HandleCliOutcome::Quit => {
-            futures::join!(quit_cli(tg_backend));
-            return Ok(());
-        }
-        HandleCliOutcome::Logout => {
-            futures::join!(log_out(tg_backend));
-            return Ok(());
-        }
-        HandleCliOutcome::Continue => {}
+    if cli_requests_session(app_context.as_ref()) {
+        return run_cli_session(app_context, tg_backend).await;
     }
 
-    tg_backend.online().await;
-    tg_backend.disable_animated_emoji(true).await;
-
-    tui_backend.enter()?;
-    tui.register_action_handler(app_context.action_tx().clone())?;
-    app_context.mark_dirty();
-
-    // Voice wake: playback thread signals so status bar position updates immediately.
+    // Open audio before the alternate screen so ALSA probe text stays off the card.
     let (voice_wake_tx, mut voice_wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     #[cfg(feature = "rodio")]
     {
@@ -73,54 +54,153 @@ pub async fn run_app(
     #[cfg(not(feature = "rodio"))]
     let _voice_wake_tx = voice_wake_tx;
 
-    // Notify ChatList to populate visible_chats from initial load (it only rebuilds on LoadChats/ChatHistoryAppended/Resize).
-    let _ = app_context
-        .action_tx()
-        .send(Action::LoadChats(ChatList::Main.into(), 200));
+    let result = async {
+        tui_backend.enter()?;
+        tui_backend.terminal.clear()?;
+        tui.register_action_handler(app_context.action_tx().clone())?;
+        app_context.set_focused_component(Some(ComponentName::Login));
+        app_context.mark_dirty();
 
-    // Refresh task: ~60 FPS. We no longer block on TUI/TG in the select, so this won't spin; wake + drain keeps UI responsive.
-    const REFRESH_MS: u64 = 16; // 1000/60 ≈ 60 FPS
-    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let refresh_tx = app_context.action_tx().clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(REFRESH_MS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if refresh_tx.send(Action::Refresh).is_err() {
+        // Refresh task: ~60 FPS. We no longer block on TUI/TG in the select, so this won't spin; wake + drain keeps UI responsive.
+        const REFRESH_MS: u64 = 16; // 1000/60 ≈ 60 FPS
+        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let refresh_tx = app_context.action_tx().clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(REFRESH_MS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if refresh_tx.send(Action::Refresh).is_err() {
+                    break;
+                }
+                let _ = wake_tx.send(());
+            }
+        });
+
+        // Main loop runs before authorization. The sign-in card is the screen until Ready.
+        // Fresh authorization states are applied before input so a rotated QR link
+        // replaces the stale card in the same turn instead of trailing one behind.
+        let mut session_booted = false;
+        while !app_context.quit_acquire() {
+            let wait_ms = REFRESH_MS;
+
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
+                _ = wake_rx.recv() => {}
+                _ = tg_wake_rx.recv() => {}
+                _ = voice_wake_rx.recv() => {}
+            }
+            if drain_auth_states(Arc::clone(&app_context), tg_backend, &mut session_booted).await {
                 break;
             }
-            let _ = wake_tx.send(());
+            while let Some(ev) = tui_backend.try_next() {
+                handle_tui_backend_one_event(Arc::clone(&app_context), tui, tui_backend, ev)
+                    .await?;
+            }
+            while let Some(ev) = tg_backend.next().await {
+                handle_tg_backend_one_event(Arc::clone(&app_context), tg_backend, ev).await?;
+            }
+            handle_app_actions(Arc::clone(&app_context), tui, tui_backend, tg_backend).await?;
         }
-    });
+        Ok(())
+    }
+    .await;
 
-    // Main loop: one blocking wait (sleep | refresh wake | TG wake), then drain TUI and TG; no select on backends so no spin.
-    while tg_backend.have_authorization {
-        let wait_ms = REFRESH_MS;
+    quit_tui(tg_backend, tui_backend).await;
+    tracing::info!("Quitting");
+    result
+}
 
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
-            _ = wake_rx.recv() => {}
-            _ = tg_wake_rx.recv() => {}
-            _ = voice_wake_rx.recv() => {}
-        }
-        while let Some(ev) = tui_backend.try_next() {
-            handle_tui_backend_one_event(Arc::clone(&app_context), tui, tui_backend, ev).await?;
-        }
-        while let Some(ev) = tg_backend.next().await {
-            handle_tg_backend_one_event(Arc::clone(&app_context), tg_backend, ev).await?;
-        }
-        handle_app_actions(Arc::clone(&app_context), tui, tui_backend, tg_backend).await?;
+fn cli_requests_session(app_context: &AppContext) -> bool {
+    let args = app_context.cli_args();
+    let telegram = args.telegram_cli();
+    telegram.logout() || telegram.send_message().is_some()
+}
 
-        if app_context.quit_acquire() {
-            quit_tui(tg_backend, tui_backend).await;
-            tracing::info!("Quitting");
+async fn run_cli_session(
+    app_context: Arc<AppContext>,
+    tg_backend: &mut TgBackend,
+) -> Result<(), AppError<Action>> {
+    // CLI commands require an existing session; interactive steps belong to the TUI.
+    loop {
+        let Some(state) = tg_backend.auth_rx.recv().await else {
+            return Ok(());
+        };
+        match tg_backend.apply_auth_state(state).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                tg_backend.close().await;
+                return Err(
+                    io::Error::other(format!("Sign-in setup failed: {}", error.message)).into(),
+                );
+            }
+        }
+        let (ready, needs_login) = {
+            let auth = app_context.td_auth();
+            (matches!(*auth, TdAuth::Ready), auth.needs_user())
+        };
+        if ready {
+            break;
+        }
+        if needs_login {
+            println!("Not signed in. Run tgt to sign in, then retry this command.");
+            tg_backend.close().await;
             return Ok(());
         }
     }
-
+    boot_session(Arc::clone(&app_context), tg_backend).await;
+    match handle_cli(app_context, tg_backend).await {
+        HandleCliOutcome::Quit | HandleCliOutcome::Continue => tg_backend.close().await,
+        HandleCliOutcome::Logout => {
+            tg_backend.log_out().await;
+            tg_backend.drain_until_closed().await;
+        }
+    }
     Ok(())
 }
+
+/// Drain authorization updates before input/rendering so only the newest QR is drawn.
+async fn drain_auth_states(
+    app_context: Arc<AppContext>,
+    tg_backend: &mut TgBackend,
+    session_booted: &mut bool,
+) -> bool {
+    while let Ok(state) = tg_backend.auth_rx.try_recv() {
+        match tg_backend.apply_auth_state(state).await {
+            Ok(true) => {
+                app_context.quit_store(true);
+                return true;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = app_context.action_tx().send(Action::LoginFailed(format!(
+                    "Sign-in setup failed: {}",
+                    error.message
+                )));
+            }
+        }
+    }
+    let ready = matches!(*app_context.td_auth(), TdAuth::Ready);
+    if !*session_booted && ready {
+        boot_session(Arc::clone(&app_context), tg_backend).await;
+        *session_booted = true;
+    }
+    false
+}
+
+async fn boot_session(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) {
+    tg_backend.use_quick_ack().await;
+    tg_backend.get_me().await;
+    tg_backend.load_chats(ChatList::Main, 200).await;
+    tg_backend.online().await;
+    tg_backend.disable_animated_emoji(true).await;
+    app_context.set_focused_component(None);
+    let _ = app_context
+        .action_tx()
+        .send(Action::LoadChats(ChatList::Main.into(), 200));
+}
+
 /// Handle a single Telegram backend event.
 async fn handle_tg_backend_one_event(
     app_context: Arc<AppContext>,
@@ -189,7 +269,6 @@ async fn handle_tg_backend_one_event(
     Ok(())
 }
 
-#[allow(clippy::await_holding_lock)]
 /// Handle a single TUI backend event.
 async fn handle_tui_backend_one_event(
     app_context: Arc<AppContext>,
@@ -206,33 +285,38 @@ async fn handle_tui_backend_one_event(
                 .send(Action::Resize(width, height))?;
         }
         Event::Key(key, modifiers) => {
+            if app_context.focused_component() == Some(ComponentName::Login) {
+                if let Some(action) = tui.handle_events(Some(Event::Key(key, modifiers)))? {
+                    app_context.action_tx().send(action)?;
+                }
+                return Ok(());
+            }
             let focused = app_context.focused_component();
-            let keymap_config = app_context.keymap_config();
             let key_event = Event::Key(key, modifiers);
 
-            // Merged map (core + component): component map includes core_window + mode-specific keys.
-            let should_check_keymap =
-                focused.is_none() || keymap_config.get_map_of(focused).contains_key(&key_event);
-
-            if should_check_keymap {
-                let keymap = keymap_config.get_map_of(focused);
-                if let Some(action_binding) = keymap.get(&key_event) {
-                    match action_binding {
-                        ActionBinding::Single { action, .. } => {
-                            app_context.action_tx().send(action.clone())?;
-                            return Ok(());
-                        }
-                        ActionBinding::Multiple(map_event_action) => {
-                            consume_until_single_action(
-                                &app_context.action_tx(),
-                                tui_backend,
-                                map_event_action.clone(),
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                    }
+            // Snapshot the binding while the keymap guard is held; neither the
+            // keymap guard nor the sender guard may live through the awaits below.
+            let matched = {
+                let keymap_config = app_context.keymap_config();
+                let should_check =
+                    focused.is_none() || keymap_config.get_map_of(focused).contains_key(&key_event);
+                if should_check {
+                    keymap_config.get_map_of(focused).get(&key_event).cloned()
+                } else {
+                    None
                 }
+            };
+            match matched {
+                Some(ActionBinding::Single { action, .. }) => {
+                    app_context.action_tx().send(action)?;
+                    return Ok(());
+                }
+                Some(ActionBinding::Multiple(map_event_action)) => {
+                    let action_tx = app_context.action_tx().clone();
+                    consume_until_single_action(&action_tx, tui_backend, map_event_action).await;
+                    return Ok(());
+                }
+                None => {}
             }
             app_context
                 .action_tx()
@@ -240,7 +324,15 @@ async fn handle_tui_backend_one_event(
         }
         Event::FocusLost => app_context.action_tx().send(Action::FocusLost)?,
         Event::FocusGained => app_context.action_tx().send(Action::FocusGained)?,
-        Event::Paste(ref text) => app_context.action_tx().send(Action::Paste(text.clone()))?,
+        Event::Paste(ref text) => {
+            if app_context.focused_component() == Some(ComponentName::Login) {
+                if let Some(action) = tui.handle_events(Some(Event::Paste(text.clone())))? {
+                    app_context.action_tx().send(action)?;
+                }
+                return Ok(());
+            }
+            app_context.action_tx().send(Action::Paste(text.clone()))?
+        }
         _ => {}
     }
 
@@ -250,7 +342,6 @@ async fn handle_tui_backend_one_event(
     Ok(())
 }
 
-#[allow(clippy::await_holding_lock)]
 /// Consume events until a single action is produced.
 /// This function is used to consume events until a single action is produced
 /// from a map of events to actions.
@@ -290,36 +381,34 @@ fn fold_chat_list_refresh_actions(actions: Vec<Action>) -> Vec<Action> {
         return actions;
     }
     let mut out = Vec::with_capacity(actions.len());
-    let mut i = 0;
-    while i < actions.len() {
-        if matches!(actions[i], Action::ChatHistoryAppended | Action::Refresh) {
-            let mut saw_refresh = false;
-            let mut saw_cha = false;
-            while i < actions.len()
-                && matches!(actions[i], Action::ChatHistoryAppended | Action::Refresh)
-            {
-                match &actions[i] {
-                    Action::Refresh => saw_refresh = true,
-                    Action::ChatHistoryAppended => saw_cha = true,
-                    _ => {}
-                }
-                i += 1;
+    let mut iter = actions.into_iter().peekable();
+    while let Some(action) = iter.next() {
+        if !matches!(action, Action::ChatHistoryAppended | Action::Refresh) {
+            // Move through untouched: cloning here would copy sign-in secrets.
+            out.push(action);
+            continue;
+        }
+        let mut saw_refresh = matches!(action, Action::Refresh);
+        let mut saw_cha = !saw_refresh;
+        while matches!(
+            iter.peek(),
+            Some(Action::ChatHistoryAppended | Action::Refresh)
+        ) {
+            match iter.next() {
+                Some(Action::Refresh) => saw_refresh = true,
+                _ => saw_cha = true,
             }
-            if saw_refresh {
-                out.push(Action::Refresh);
-            }
-            if saw_cha {
-                out.push(Action::ChatHistoryAppended);
-            }
-        } else {
-            out.push(actions[i].clone());
-            i += 1;
+        }
+        if saw_refresh {
+            out.push(Action::Refresh);
+        }
+        if saw_cha {
+            out.push(Action::ChatHistoryAppended);
         }
     }
     out
 }
 
-/// Returns true for actions that change UI-visible state and should trigger a render.
 fn action_changes_ui(action: &Action) -> bool {
     matches!(
         action,
@@ -385,6 +474,7 @@ fn action_changes_ui(action: &Action) -> bool {
             | Action::UpdateArea(_)
             | Action::GetChatHistoryNewer
             | Action::ChatHistoryAppended
+            | Action::LoginFailed(_)
     )
 }
 
@@ -392,9 +482,10 @@ fn action_changes_ui(action: &Action) -> bool {
 ///
 /// Bursts of [`Action::ChatHistoryAppended`] / [`Action::Refresh`] are folded before handling
 /// ([`fold_chat_list_refresh_actions`]) so one TDLib flurry does not run thousands of chat-list
-/// rebuilds in a single turn. [`crate::tg::tg_context::TgContext`] mutexes are not held across
+/// rebuilds in a single turn. Sign-in actions move into the background TDLib task
+/// ([`TgBackend::submit_login`]) without blocking this turn or cloning secrets
+/// across components. [`crate::tg::tg_context::TgContext`] mutexes are not held across
 /// `.await` in the [`Action::GetChatHistory`] path (loads use discrete lock regions per batch).
-#[allow(clippy::await_holding_lock)]
 ///
 /// # Arguments
 /// * `app_context` - An Arc wrapped AppContext struct.
@@ -431,6 +522,13 @@ pub async fn handle_app_actions(
     }
 
     for action in folded {
+        // Sign-in submissions move into the background TDLib task; failures return
+        // as LoginFailed, which still fans out below so the card can show the error.
+        if let Action::Login(request) = action {
+            tg_backend.submit_login(request);
+            app_context.mark_dirty();
+            continue;
+        }
         match &action {
             Action::Render => {
                 // Actual draw happens at end of loop when should_render()
@@ -562,7 +660,7 @@ pub async fn handle_app_actions(
 
                     let tg = app_context.tg_context();
                     loaded_count += entries.len();
-                    tg.open_chat_messages().insert_messages(entries.clone());
+                    tg.open_chat_messages().insert_messages(entries);
                 }
 
                 app_context.tg_context().set_history_loading(false);
@@ -958,7 +1056,7 @@ pub async fn handle_app_actions(
         if action_changes_ui(&action) {
             app_context.mark_dirty();
         }
-        tui.update(action.clone())
+        tui.update(action)
     }
 
     if raw_len >= 32 {
@@ -984,7 +1082,6 @@ enum HandleCliOutcome {
     Logout,
 }
 
-#[allow(clippy::await_holding_lock)]
 /// Handle the command line arguments.
 /// This function will handle the command line arguments.
 ///
@@ -993,18 +1090,24 @@ enum HandleCliOutcome {
 /// * `tui_backend` - A mutable reference to the TuiBackend struct.
 /// * `tg_backend` - A mutable reference to the TgBackend struct.
 async fn handle_cli(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) -> HandleCliOutcome {
-    if app_context.cli_args().telegram_cli().logout() {
+    // Snapshot CLI state while the guard is held; a parking_lot guard must
+    // never live through the network awaits below.
+    let (logout, send_request) = {
+        let args = app_context.cli_args();
+        let telegram = args.telegram_cli();
+        (telegram.logout(), telegram.send_message().cloned())
+    };
+    if logout {
         return HandleCliOutcome::Logout;
     }
-    if let Some(chat) = app_context.cli_args().telegram_cli().send_message() {
-        futures::join!(tg_backend.load_all_chats());
-
-        let [chat_name, message_text] = chat.as_slice() else {
+    if let Some(chat) = send_request {
+        let Ok([chat_name, message_text]) = <[String; 2]>::try_from(chat) else {
             tracing::error!("Invalid number of arguments for send message");
             println!("Invalid number of arguments for send message");
             return HandleCliOutcome::Quit;
         };
-        match tg_backend.search_chats(chat_name.to_string()).await {
+        tg_backend.load_all_chats().await;
+        match tg_backend.search_chats(chat_name.clone()).await {
             Ok(chat) => {
                 tracing::info!("Chat found: {:?}", chat);
                 let total_chats = chat.total_count;
@@ -1021,7 +1124,7 @@ async fn handle_cli(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) ->
                 }
                 let chat_id = chats_vec[0];
                 let msg = tg_backend
-                    .send_message(message_text.to_string(), chat_id, None)
+                    .send_message(message_text.clone(), chat_id, None)
                     .await;
                 match msg {
                     Ok(msg) => {
@@ -1074,39 +1177,12 @@ async fn handle_cli(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) ->
 /// * `tg_backend` - A mutable reference to the TgBackend struct.
 /// * `tui_backend` - A mutable reference to the TuiBackend struct.
 async fn quit_tui(tg_backend: &mut TgBackend, tui_backend: &mut TuiBackend) {
-    futures::join!(tg_backend.offline());
-    tg_backend.have_authorization = false;
-    tg_backend.close().await;
     tui_backend.exit();
-    tg_backend.handle_authorization_state().await;
-
-    // Clear the terminal and move the cursor to the top left corner
-    io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
-}
-
-/// Quit the cli.
-///
-/// # Arguments
-/// * `tg_backend` - A mutable reference to the TgBackend struct.
-async fn quit_cli(tg_backend: &mut TgBackend) {
-    tg_backend.have_authorization = false;
+    let ready = matches!(*tg_backend.app_context.td_auth(), TdAuth::Ready);
+    if ready {
+        tg_backend.offline().await;
+    }
     tg_backend.close().await;
-    tg_backend.handle_authorization_state().await;
-
-    // Clear the terminal and move the cursor to the top left corner
-    io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
-}
-
-/// Logout the user from the Telegram backend.
-///
-/// # Arguments
-/// * `tg_backend` - A mutable reference to the TgBackend struct.
-async fn log_out(tg_backend: &mut TgBackend) {
-    tg_backend.log_out().await;
-    tg_backend.handle_authorization_state().await;
-
-    // Clear the terminal and move the cursor to the top left corner
-    io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
 }
 
 #[cfg(test)]

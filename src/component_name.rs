@@ -32,6 +32,8 @@ pub enum ComponentName {
     FileDownloadExplorer,
     /// Pinned messages browser popup (open chat).
     PinnedMessagesPopup,
+    /// Sign-in card shown before the session is authorized.
+    Login,
 }
 
 impl ComponentName {
@@ -68,6 +70,7 @@ impl Display for ComponentName {
             ComponentName::FileUploadExplorer => write!(f, "File Upload Explorer"),
             ComponentName::FileDownloadExplorer => write!(f, "File Download Explorer"),
             ComponentName::PinnedMessagesPopup => write!(f, "Pinned Messages"),
+            ComponentName::Login => write!(f, "Login"),
         }
     }
 }

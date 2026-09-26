@@ -84,6 +84,33 @@ impl From<Modifiers> for KeyModifiers {
     }
 }
 
+/// Sign-in credential submitted from the login card.
+/// Carried by [`Action::Login`] and sent to TDLib on a background task.
+/// `Debug` redacts every payload so credentials never reach logs.
+#[derive(Clone, Eq, PartialEq)]
+pub enum LoginRequest {
+    /// Ask TDLib for a QR login link.
+    Qr,
+    /// Submit the phone number from the sign-in card.
+    Phone(String),
+    /// Submit the SMS or app login code.
+    Code(String),
+    /// Submit the cloud password (verbatim).
+    Password(String),
+    /// Submit an email address Telegram asked for.
+    Email(String),
+    /// Submit the email verification code.
+    EmailCode(String),
+    /// Submit first and last name for a new account.
+    Registration { first: String, last: String },
+}
+// Login secrets must not reach logs; mirror `TdAuth`'s redaction.
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoginRequest([redacted])")
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 // Action` is an enum that represents an action that can be handled by the
 /// main application loop and the components of the user interface.
@@ -323,6 +350,11 @@ pub enum Action {
     HideFileDownloadExplorer,
     /// Download/copy a Telegram file to `dest_path` (full path including file name).
     SaveChatFileAs { message_id: i64, dest_path: String },
+
+    /// Sign-in credential from the login card; submitted to TDLib in the background.
+    Login(LoginRequest),
+    /// A sign-in request was rejected. The card shows `message`.
+    LoginFailed(String),
 }
 /// Implement the `Action` enum.
 impl Action {
@@ -406,5 +438,46 @@ impl FromStr for Action {
             "play_voice_message" => Ok(Action::ToggleVoicePlayback),
             _ => Err(AppError::InvalidAction(s.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod login_request_tests {
+    use super::{Action, LoginRequest};
+    use crate::tg::login_phase::TdAuth;
+
+    #[test]
+    fn debug_redacts_every_credential() {
+        let secrets = [
+            "+15551234567",
+            "12345",
+            "hunter2 hunter2",
+            "user@example.com",
+            "Jane",
+            "Doe",
+        ];
+        let requests = [
+            LoginRequest::Phone(secrets[0].into()),
+            LoginRequest::Code(secrets[1].into()),
+            LoginRequest::Password(secrets[2].into()),
+            LoginRequest::Email(secrets[3].into()),
+            LoginRequest::EmailCode(secrets[1].into()),
+            LoginRequest::Registration {
+                first: secrets[4].into(),
+                last: secrets[5].into(),
+            },
+        ];
+        for request in requests {
+            let debug = format!("{:?}", Action::Login(request));
+            for secret in secrets {
+                assert!(!debug.contains(secret), "{debug} leaks {secret}");
+            }
+        }
+        let auth = TdAuth::WaitOtherDevice {
+            link: "tg://login?token=secret".into(),
+        };
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("tg://"));
     }
 }
