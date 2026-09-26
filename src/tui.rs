@@ -88,8 +88,9 @@ impl Tui {
             self.login.draw(frame, area)?;
             return Ok(());
         }
-        // The card stops drawing from here on; wipe its buffers and QR cache.
-        self.login.clear_secrets();
+        // The card stops drawing from here on; sync to Ready through the
+        // regular update path so buffers and the QR cache are wiped.
+        self.login.update(Action::Refresh);
 
         self.component(&ComponentName::StatusBar)
             .update(Action::UpdateArea(area));

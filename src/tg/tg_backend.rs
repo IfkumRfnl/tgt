@@ -1,4 +1,4 @@
-use crate::action::Action;
+use crate::action::{Action, LoginRequest};
 use crate::event::Event;
 use crate::{app_context::AppContext, tg::ordered_chat::OrderedChat};
 use std::collections::{BTreeSet, VecDeque};
@@ -138,11 +138,16 @@ impl TgBackend {
         }
     }
 
-    pub async fn close(&self) {
+    /// Close the client and wait for its shutdown update.
+    pub async fn close(&mut self) {
+        if self.can_quit.load(Ordering::Acquire) {
+            return;
+        }
         match functions::close(self.client_id).await {
             Ok(me) => tracing::info!("TDLib client closed: {:?}", me),
             Err(error) => tracing::error!("Error closing TDLib client: {:?}", error),
         }
+        self.drain_until_closed().await;
     }
 
     pub async fn view_all_messages(&self) {
@@ -621,90 +626,71 @@ impl TgBackend {
                 return Ok(false);
             }
         };
-        // TdAuth's Debug redacts the login link.
         tracing::debug!("TDLib authorization step: {auth:?}");
         *self.app_context.td_auth() = auth;
         self.app_context.mark_dirty();
         Ok(closed)
     }
 
-    /// Keep receiving until TDLib closes, bounded in case the client stops responding.
+    /// Wait for TDLib to close, bounded in case the client stops responding.
     pub async fn drain_until_closed(&mut self) {
         if self.can_quit.load(Ordering::Acquire) {
             return;
         }
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => {
-                    tracing::warn!("Timed out waiting for TDLib to close");
-                    self.can_quit.store(true, Ordering::Release);
+        let closed = async {
+            while let Some(state) = self.auth_rx.recv().await {
+                if matches!(state, AuthorizationState::Closed) {
                     break;
                 }
-                update = self.auth_rx.recv() => {
-                    let Some(state) = update else {
-                        self.can_quit.store(true, Ordering::Release);
-                        break;
-                    };
-                    if matches!(state, AuthorizationState::Closed) {
-                        *self.app_context.td_auth() = TdAuth::Starting;
-                        self.app_context.mark_dirty();
-                        self.can_quit.store(true, Ordering::Release);
-                        break;
-                    }
-                }
             }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), closed)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Timed out waiting for TDLib to close");
         }
+        *self.app_context.td_auth() = TdAuth::Starting;
+        self.app_context.mark_dirty();
+        self.can_quit.store(true, Ordering::Release);
     }
 
     /// Submit without blocking input or QR rotation; report failures on the action queue.
-    pub fn submit_login(&self, action: Action) {
+    pub fn submit_login(&self, request: LoginRequest) {
         let client_id = self.client_id;
         let action_tx = self.app_context.action_tx().clone();
         tokio::spawn(async move {
-            let result: Result<(), tdlib_rs::types::Error> = match action {
-                Action::LoginSelectQr => {
-                    functions::request_qr_code_authentication(Vec::new(), client_id)
-                        .await
-                        .map(|_| ())
+            let result = match request {
+                LoginRequest::Qr => {
+                    functions::request_qr_code_authentication(Vec::new(), client_id).await
                 }
-                Action::LoginSubmitPhone(phone) => {
-                    functions::set_authentication_phone_number(phone, None, client_id)
-                        .await
-                        .map(|_| ())
+                LoginRequest::Phone(phone) => {
+                    functions::set_authentication_phone_number(phone, None, client_id).await
                 }
-                Action::LoginSubmitCode(code) => {
-                    functions::check_authentication_code(code, client_id)
-                        .await
-                        .map(|_| ())
+                LoginRequest::Code(code) => {
+                    functions::check_authentication_code(code, client_id).await
                 }
-                Action::LoginSubmitPassword(password) => {
-                    functions::check_authentication_password(password, client_id)
-                        .await
-                        .map(|_| ())
+                LoginRequest::Password(password) => {
+                    functions::check_authentication_password(password, client_id).await
                 }
-                Action::LoginSubmitEmail(email) => {
-                    functions::set_authentication_email_address(email, client_id)
-                        .await
-                        .map(|_| ())
+                LoginRequest::Email(email) => {
+                    functions::set_authentication_email_address(email, client_id).await
                 }
-                Action::LoginSubmitEmailCode(code) => functions::check_authentication_email_code(
-                    enums::EmailAddressAuthentication::Code(
-                        tdlib_rs::types::EmailAddressAuthenticationCode { code },
-                    ),
-                    client_id,
-                )
-                .await
-                .map(|_| ()),
-                Action::LoginSubmitRegistration { first, last } => {
-                    functions::register_user(first, last, false, client_id)
-                        .await
-                        .map(|_| ())
+                LoginRequest::EmailCode(code) => {
+                    functions::check_authentication_email_code(
+                        enums::EmailAddressAuthentication::Code(
+                            tdlib_rs::types::EmailAddressAuthenticationCode { code },
+                        ),
+                        client_id,
+                    )
+                    .await
                 }
-                _ => Ok(()),
+                LoginRequest::Registration { first, last } => {
+                    functions::register_user(first, last, false, client_id).await
+                }
             };
             if let Err(error) = result {
-                // Do not log server text or credential-bearing actions.
+                // Do not log server text or credential-bearing requests.
                 tracing::error!("sign-in request failed (code {})", error.code);
                 let _ = action_tx.send(Action::LoginFailed(error.message));
             }

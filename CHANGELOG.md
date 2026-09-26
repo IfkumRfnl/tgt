@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Changed
 
+- Simplified sign-in with a shared form renderer, direct QR-cell painting, and typed requests whose debug output redacts credentials.
 - Upgraded **tdlib-rs** to v1.4.0 (new `static` feature, `ureq` replaces `reqwest`, Android support, `#[link]` attribute removed from tdjson FFI).
 - UI render-on-demand to reduce idle CPU while keeping Telegram-driven updates responsive.
 - Focus tracking uses atomics instead of a mutex for lock-free reads/writes.
@@ -38,6 +39,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - QR login keeps its scanner quiet zone when resized or displaying errors, avoids logging login links, and clears credentials when authorization finishes.
 - Authorization and multi-key command handling release shared-context locks before asynchronous work.
 - Failed audio initialization disables playback instead of leaving a disconnected command sender.
+- Sign-in errors survive authorization transitions; quitting restores the previous terminal contents without clearing them afterward.
 - Stack overflow in the prompt when wrapping at the window edge (`insert_newline` no longer recurses through `insert('\n')`).
 - Occasional startup hangs and chat list refresh hangs.
 - Chat search reliability and clearer failure feedback via the status bar.

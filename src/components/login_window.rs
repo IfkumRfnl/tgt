@@ -1,5 +1,5 @@
 use crate::{
-    action::Action,
+    action::{Action, LoginRequest},
     app_context::AppContext,
     app_error::AppError,
     components::component_traits::{Component, HandleFocus},
@@ -9,44 +9,19 @@ use crate::{
 use crossterm::event::{KeyCode, KeyModifiers};
 use qrcode::{Color as QrColor, EcLevel, QrCode};
 use ratatui::{
-    layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    layout::Rect,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
+    Frame,
 };
-use std::{io, sync::Arc};
+use std::{borrow::Cow, io, sync::Arc};
 use unicode_width::UnicodeWidthStr;
 
-const TEXT_CARD_WIDTH: u16 = 52;
-/// Quiet-zone border around the QR matrix, in modules. Scanners need this
-/// blank margin, so rendering never shrinks it to fit a small terminal.
-const QR_QUIET: usize = 4;
-/// Largest module scale tried first; larger codes scan more reliably.
-const QR_MAX_SCALE: usize = 3;
-/// Narrowest terminal that can still fit a version-1 QR code at scale 1.
-/// Below this only the resize note fits, never a clipped code or token.
-const QR_MIN_COLS: usize = 21;
+const TEXT_W: u16 = 52;
+const QUIET: usize = 4;
 
-/// Which prompt is accepting keystrokes. TDLib already says which step this is.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Field {
-    Phone,
-    Code,
-    Password,
-    Email,
-    EmailCode,
-    Name,
-}
-
-/// The two rows on the sign-in menu.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MenuRow {
-    Qr,
-    Phone,
-}
-
-/// QR encoding cached by link. Encoding runs once per rotated token; every
-/// draw after that only picks a scale and paints half-block rows.
+/// Encode once per token; prefer medium correction, falling back to low to fit.
 struct CachedQr {
     medium: Option<QrCode>,
     low: Option<QrCode>,
@@ -54,31 +29,36 @@ struct CachedQr {
 
 impl CachedQr {
     fn fresh(link: &str) -> Self {
-        let bytes = link.as_bytes();
         Self {
-            medium: QrCode::with_error_correction_level(bytes, EcLevel::M).ok(),
-            low: QrCode::with_error_correction_level(bytes, EcLevel::L).ok(),
+            medium: QrCode::with_error_correction_level(link.as_bytes(), EcLevel::M).ok(),
+            low: QrCode::with_error_correction_level(link.as_bytes(), EcLevel::L).ok(),
         }
+    }
+
+    fn pick(&self, width: usize, height: usize) -> Option<(&QrCode, usize)> {
+        for scale in (1..=3).rev() {
+            for code in self.medium.iter().chain(self.low.iter()) {
+                let pixels = (code.width() + QUIET * 2) * scale;
+                if pixels <= width && pixels.div_ceil(2) <= height {
+                    return Some((code, scale));
+                }
+            }
+        }
+        None
     }
 }
 
-/// Sign-in card shown before [`TdAuth::Ready`].
+/// TDLib owns the authorization step; the component owns input and presentation.
 pub struct LoginWindow {
     app_context: Arc<AppContext>,
-    /// Current field. During registration this is the first name.
-    text: String,
-    /// Last name. Used only while registering.
-    last: String,
-    /// Registration cursor is on the last name.
-    on_last: bool,
-    menu: MenuRow,
-    /// `WaitPhoneNumber` is showing the phone field rather than the menu.
-    phone_entry: bool,
-    error: Option<String>,
-    /// A submit is in flight. On the menu this means the QR link was asked
-    /// for and the card shows the requesting state instead of the menu.
-    busy: bool,
     state: TdAuth,
+    text: String,
+    last: String,
+    on_last: bool,
+    qr_selected: bool,
+    phone_entry: bool,
+    busy: bool,
+    error: Option<String>,
     qr: Option<CachedQr>,
 }
 
@@ -86,345 +66,362 @@ impl LoginWindow {
     pub fn new(app_context: Arc<AppContext>) -> Self {
         Self {
             app_context,
+            state: TdAuth::Starting,
             text: String::new(),
             last: String::new(),
             on_last: false,
-            menu: MenuRow::Qr,
+            qr_selected: true,
             phone_entry: false,
-            error: None,
             busy: false,
-            state: TdAuth::Starting,
+            error: None,
             qr: None,
         }
     }
 
-    /// Drop every credential and token. [`crate::tui::Tui`] calls this when
-    /// TDLib reports [`TdAuth::Ready`], once the card stops drawing.
-    pub fn clear_secrets(&mut self) {
-        self.reset_form();
-        self.state = TdAuth::Ready;
-    }
-
-    /// Wipe typed input, errors and the QR cache without changing the step.
-    fn reset_form(&mut self) {
+    fn sync_auth(&mut self) {
+        let state = {
+            let state = self.app_context.td_auth();
+            if *state == self.state {
+                return;
+            }
+            state.clone()
+        };
+        // Drop credential buffers on every transition, including Ready.
         self.text = String::new();
         self.last = String::new();
         self.on_last = false;
         self.phone_entry = false;
-        self.error = None;
         self.busy = false;
-        self.qr = None;
-    }
-
-    /// Reset the form on a transition; encode each new QR token only once.
-    fn sync_auth(&mut self) {
-        let auth = {
-            let auth = self.app_context.td_auth();
-            if self.state == *auth {
-                return;
-            }
-            auth.clone()
-        };
-        self.reset_form();
-        self.qr = match &auth {
+        self.error = None;
+        self.qr = match &state {
             TdAuth::WaitOtherDevice { link } => Some(CachedQr::fresh(link)),
             _ => None,
         };
-        self.state = auth;
+        self.state = state;
     }
 
-    fn field_for(&self) -> Option<Field> {
+    fn editing(&self) -> bool {
         match self.state {
-            TdAuth::WaitPhoneNumber if self.phone_entry => Some(Field::Phone),
-            TdAuth::WaitCode => Some(Field::Code),
-            TdAuth::WaitPassword => Some(Field::Password),
-            TdAuth::WaitEmail => Some(Field::Email),
-            TdAuth::WaitEmailCode => Some(Field::EmailCode),
-            TdAuth::WaitRegistration => Some(Field::Name),
-            _ => None,
+            TdAuth::WaitPhoneNumber => self.phone_entry,
+            TdAuth::Starting | TdAuth::WaitOtherDevice { .. } | TdAuth::Ready => false,
+            _ => true,
         }
     }
 
-    fn active_text(&mut self) -> &mut String {
-        if self.on_last && matches!(self.state, TdAuth::WaitRegistration) {
+    fn insert_str(&mut self, text: &str) {
+        if !self.editing() {
+            return;
+        }
+        let input = if self.on_last {
             &mut self.last
         } else {
             &mut self.text
+        };
+        let mut len = input.chars().count();
+        for ch in text.chars() {
+            let accepted = match self.state {
+                TdAuth::WaitPhoneNumber => {
+                    len < 32
+                        && (ch.is_ascii_digit()
+                            || matches!(ch, ' ' | '-')
+                            || (ch == '+'
+                                && !input.contains('+')
+                                && !input.chars().any(|ch| ch.is_ascii_digit())))
+                }
+                TdAuth::WaitCode | TdAuth::WaitEmailCode => len < 16 && ch.is_ascii_alphanumeric(),
+                TdAuth::WaitEmail => len < 128 && !ch.is_control() && !ch.is_whitespace(),
+                _ => len < 128 && !ch.is_control(),
+            };
+            if accepted {
+                input.push(ch);
+                len += 1;
+            }
         }
+        self.error = None;
     }
 
     fn on_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
-        if modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(code, KeyCode::Char('c') | KeyCode::Char('q'))
-        {
-            return Some(Action::Quit);
-        }
-
         self.sync_auth();
-        let on_menu = matches!(self.state, TdAuth::WaitPhoneNumber) && !self.phone_entry;
-        let quit_pressed = matches!(code, KeyCode::Esc | KeyCode::Char('q'));
-        if quit_pressed
-            && (on_menu
-                || matches!(
-                    self.state,
-                    TdAuth::Starting | TdAuth::WaitOtherDevice { .. }
-                ))
+        let menu = matches!(self.state, TdAuth::WaitPhoneNumber) && !self.phone_entry;
+        let editing = self.editing();
+        if (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'q')))
+            || (matches!(code, KeyCode::Esc | KeyCode::Char('q')) && !editing)
         {
             return Some(Action::Quit);
-        }
-        if code == KeyCode::Esc
-            && !self.busy
-            && self.phone_entry
-            && matches!(self.state, TdAuth::WaitPhoneNumber)
-        {
-            self.phone_entry = false;
-            self.menu = MenuRow::Phone;
-            self.error = None;
-            self.app_context.mark_dirty();
-            return None;
         }
         if self.busy {
             return None;
         }
-        if on_menu {
-            return self.on_menu_key(code);
-        }
-        self.on_field_key(code)
-    }
-
-    fn on_menu_key(&mut self, code: KeyCode) -> Option<Action> {
-        match code {
-            KeyCode::Up => self.menu = MenuRow::Qr,
-            KeyCode::Down => self.menu = MenuRow::Phone,
-            KeyCode::Enter => {
-                self.error = None;
-                self.app_context.mark_dirty();
-                match self.menu {
-                    MenuRow::Qr => {
-                        self.busy = true;
-                        return Some(Action::LoginSelectQr);
-                    }
-                    MenuRow::Phone => {
-                        self.phone_entry = true;
-                        self.text = String::new();
-                        return None;
-                    }
-                }
-            }
-            _ => return None,
-        }
         self.app_context.mark_dirty();
+        if menu {
+            match code {
+                KeyCode::Up => self.qr_selected = true,
+                KeyCode::Down => self.qr_selected = false,
+                KeyCode::Enter if self.qr_selected => {
+                    self.busy = true;
+                    self.error = None;
+                    return Some(Action::Login(LoginRequest::Qr));
+                }
+                KeyCode::Enter => {
+                    self.phone_entry = true;
+                    self.text.clear();
+                    self.error = None;
+                }
+                _ => {}
+            }
+        } else if editing {
+            match code {
+                KeyCode::Esc if self.phone_entry => {
+                    self.phone_entry = false;
+                    self.qr_selected = false;
+                    self.error = None;
+                }
+                KeyCode::Char(ch) => self.insert_str(ch.encode_utf8(&mut [0; 4])),
+                KeyCode::Backspace => {
+                    if self.on_last {
+                        self.last.pop();
+                    } else {
+                        self.text.pop();
+                    }
+                    self.error = None;
+                }
+                KeyCode::Tab if matches!(self.state, TdAuth::WaitRegistration) => {
+                    self.on_last = !self.on_last;
+                }
+                KeyCode::Enter => return self.submit(),
+                _ => {}
+            }
+        }
         None
     }
 
-    fn on_field_key(&mut self, code: KeyCode) -> Option<Action> {
-        let field = self.field_for()?;
-        match code {
-            KeyCode::Char(ch) => {
-                let buffer = self.active_text();
-                if accept_char(field, buffer, ch) {
-                    buffer.push(ch);
-                    self.error = None;
-                    self.app_context.mark_dirty();
-                }
-                None
-            }
-            KeyCode::Backspace => {
-                self.active_text().pop();
-                self.error = None;
-                self.app_context.mark_dirty();
-                None
-            }
-            KeyCode::Tab if matches!(field, Field::Name) => {
-                self.on_last = !self.on_last;
-                self.app_context.mark_dirty();
-                None
-            }
-            KeyCode::Enter => self.submit(field),
-            _ => None,
-        }
-    }
-
-    fn insert_str(&mut self, pasted: &str) {
-        let Some(field) = self.field_for() else {
-            return;
-        };
-        for ch in pasted.chars() {
-            let buffer = self.active_text();
-            if accept_char(field, buffer, ch) {
-                buffer.push(ch);
-            }
-        }
-        self.error = None;
-        self.app_context.mark_dirty();
-    }
-
-    fn submit(&mut self, field: Field) -> Option<Action> {
-        if matches!(field, Field::Name) && !self.on_last {
+    fn submit(&mut self) -> Option<Action> {
+        if matches!(self.state, TdAuth::WaitRegistration) && !self.on_last {
             self.on_last = true;
-            self.app_context.mark_dirty();
             return None;
         }
-        let action = match field {
-            Field::Phone => {
-                let phone = normalize_phone(&self.text);
-                if phone.len() < 5 {
-                    return self.fail("Include the country code, for example +1…");
-                }
-                Action::LoginSubmitPhone(phone)
+        let value = if matches!(self.state, TdAuth::WaitPassword) {
+            self.text.as_str()
+        } else {
+            self.text.trim()
+        };
+        let error = match self.state {
+            TdAuth::WaitPhoneNumber
+                if value
+                    .chars()
+                    .filter(|ch| ch.is_ascii_digit() || *ch == '+')
+                    .count()
+                    < 5 =>
+            {
+                Some("Include the country code, for example +1…")
             }
-            Field::Code => {
-                let value = self.text.trim().to_string();
-                if value.is_empty() {
-                    return self.fail("Enter the code Telegram sent you.");
-                }
-                Action::LoginSubmitCode(value)
-            }
-            Field::EmailCode => {
-                let value = self.text.trim().to_string();
-                if value.is_empty() {
-                    return self.fail("Enter the email code.");
-                }
-                Action::LoginSubmitEmailCode(value)
-            }
-            Field::Password => {
-                if self.text.is_empty() {
-                    return self.fail("Enter your cloud password.");
-                }
-                Action::LoginSubmitPassword(self.text.clone())
-            }
-            Field::Email => {
-                let value = self.text.trim().to_string();
-                if !value.contains('@') {
-                    return self.fail("Enter an email address.");
-                }
-                Action::LoginSubmitEmail(value)
-            }
-            Field::Name => {
-                let value = self.text.trim().to_string();
-                if value.is_empty() {
-                    return self.fail("First name is required.");
-                }
-                Action::LoginSubmitRegistration {
-                    first: value,
-                    last: self.last.trim().to_string(),
-                }
-            }
+            TdAuth::WaitEmail if !value.contains('@') => Some("Enter an email address."),
+            _ if value.is_empty() => Some("This field is required."),
+            _ => None,
+        };
+        if let Some(error) = error {
+            self.error = Some(error.into());
+            return None;
+        }
+        let request = match self.state {
+            TdAuth::WaitPhoneNumber => LoginRequest::Phone(normalize_phone(value)),
+            TdAuth::WaitCode => LoginRequest::Code(value.into()),
+            TdAuth::WaitPassword => LoginRequest::Password(value.into()),
+            TdAuth::WaitEmail => LoginRequest::Email(value.into()),
+            TdAuth::WaitEmailCode => LoginRequest::EmailCode(value.into()),
+            TdAuth::WaitRegistration => LoginRequest::Registration {
+                first: value.into(),
+                last: self.last.trim().into(),
+            },
+            _ => return None,
         };
         self.busy = true;
         self.error = None;
-        self.app_context.mark_dirty();
-        Some(action)
+        Some(Action::Login(request))
     }
 
-    fn fail(&mut self, message: &str) -> Option<Action> {
-        self.error = Some(message.to_string());
-        self.app_context.mark_dirty();
-        None
+    fn lines(&self) -> Vec<Line<'_>> {
+        let mut lines = match self.state {
+            TdAuth::Starting => vec![Line::from("Connecting to Telegram…"), hint("q quits")],
+            TdAuth::WaitPhoneNumber if !self.phone_entry => {
+                if self.busy {
+                    vec![Line::from("Requesting a QR code…"), hint("q quits")]
+                } else {
+                    let mut lines = vec![Line::from("Choose how to sign in"), Line::default()];
+                    for (selected, label) in [
+                        (self.qr_selected, "Log in with a QR code"),
+                        (!self.qr_selected, "Log in with a phone number"),
+                    ] {
+                        lines.push(Line::from(Span::styled(
+                            format!(" {}  {label}", if selected { ">" } else { " " }),
+                            if selected {
+                                active_style()
+                            } else {
+                                Style::default()
+                            },
+                        )));
+                    }
+                    lines.extend([Line::default(), hint("↑↓ move    enter select    q quit")]);
+                    lines
+                }
+            }
+            TdAuth::WaitOtherDevice { .. } => vec![
+                Line::from("Make the terminal larger to sign in."),
+                hint("q quits"),
+            ],
+            TdAuth::Ready => Vec::new(),
+            TdAuth::WaitPhoneNumber
+            | TdAuth::WaitCode
+            | TdAuth::WaitPassword
+            | TdAuth::WaitEmail
+            | TdAuth::WaitEmailCode
+            | TdAuth::WaitRegistration => {
+                let (title, label) = match self.state {
+                    TdAuth::WaitPhoneNumber => ("Phone number", "Include the country code"),
+                    TdAuth::WaitCode => ("Verification code", "Code from Telegram"),
+                    TdAuth::WaitPassword => ("Cloud password", "Two-step verification"),
+                    TdAuth::WaitEmail => ("Email address", "Telegram asked for an email"),
+                    TdAuth::WaitEmailCode => ("Email code", "Code sent to your email"),
+                    TdAuth::WaitRegistration => ("New account", "First name"),
+                    _ => unreachable!(),
+                };
+                let registration = matches!(self.state, TdAuth::WaitRegistration);
+                let mut lines = vec![Line::from(title), Line::default()];
+                let fields = [
+                    (label, &self.text, !self.on_last),
+                    ("Last name", &self.last, self.on_last),
+                ];
+                for (label, value, selected) in
+                    fields.into_iter().take(if registration { 2 } else { 1 })
+                {
+                    let shown = if matches!(self.state, TdAuth::WaitPassword) {
+                        Cow::Owned("•".repeat(value.chars().count()))
+                    } else {
+                        Cow::Borrowed(value.as_str())
+                    };
+                    lines.push(Line::from(label));
+                    lines.push(
+                        Line::from(vec![
+                            Span::raw(" "),
+                            Span::raw(shown),
+                            Span::raw(if selected { "█" } else { "" }),
+                        ])
+                        .style(if selected {
+                            active_style()
+                        } else {
+                            Style::default()
+                        }),
+                    );
+                }
+                lines.push(Line::default());
+                lines.push(hint(if registration {
+                    "tab switches fields    enter continues    ctrl-c quits"
+                } else if self.phone_entry {
+                    "enter submits    esc back    ctrl-c quits"
+                } else {
+                    "enter submits    ctrl-c quits"
+                }));
+                lines
+            }
+        };
+        lines.extend(self.error_lines());
+        lines
     }
 
-    fn draw_card(&self, frame: &mut ratatui::Frame<'_>, area: Rect, lines: Vec<Line>, width: u16) {
-        let card_width = width.min(area.width).max(1);
-        let inner = usize::from(card_width.saturating_sub(2).max(1));
-        let body_rows: usize = lines
-            .iter()
-            .map(|line| line.width().div_ceil(inner).max(1))
-            .sum();
-        let body_rows = u16::try_from(body_rows).unwrap_or(u16::MAX);
-        let card_height = body_rows.saturating_add(2).min(area.height).max(1);
+    fn error_lines(&self) -> impl Iterator<Item = Line<'_>> {
+        self.error.as_deref().into_iter().flat_map(|error| {
+            std::iter::once(Line::default())
+                .chain(error.lines().map(|line| Line::styled(line, Color::Red)))
+        })
+    }
+
+    fn card(&self, frame: &mut Frame<'_>, area: Rect, width: u16, height: u16) -> Rect {
+        let card = centered_rect(width, height, area);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.app_context.style_border_component_focused())
-            .title(" Sign in ");
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .alignment(Alignment::Left)
-            .wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, centered_rect(card_width, card_height, area));
+            .title(if matches!(self.state, TdAuth::WaitOtherDevice { .. }) {
+                " Sign in · q quits "
+            } else {
+                " Sign in "
+            });
+        let inner = block.inner(card);
+        frame.render_widget(block, card);
+        inner
     }
 
-    fn menu_lines(&self) -> Vec<Line<'static>> {
-        let options = [
-            (MenuRow::Qr, "Log in with a QR code"),
-            (MenuRow::Phone, "Log in with a phone number"),
-        ];
-        let mut lines = vec![Line::from("Choose how to sign in"), Line::from("")];
-        for (row, label) in options {
-            let marker = if row == self.menu { ">" } else { " " };
-            let style = if row == self.menu {
-                active_style()
-            } else {
-                Style::default()
-            };
-            lines.push(Line::from(Span::styled(
-                format!(" {marker}  {label}"),
-                style,
-            )));
+    fn draw_qr(&self, frame: &mut Frame<'_>, area: Rect) -> bool {
+        let width = usize::from(area.width.saturating_sub(2));
+        let height = usize::from(area.height.saturating_sub(2));
+        let errors: Vec<_> = self.error_lines().collect();
+        let error_width = errors.iter().map(Line::width).max().unwrap_or(0);
+        if errors.len() > height || error_width > width {
+            return false;
         }
-        lines.push(Line::from(""));
-        lines.push(hint("↑↓ move    enter select    q quit"));
-        push_error(&mut lines, self.error.as_deref());
-        lines
-    }
-
-    fn field_lines(
-        &self,
-        intro: &'static str,
-        label: &'static str,
-        value: &str,
-        masked: bool,
-        footer: &'static str,
-    ) -> Vec<Line<'static>> {
-        let shown = if masked {
-            "•".repeat(value.chars().count())
+        let Some((code, scale)) = self
+            .qr
+            .as_ref()
+            .and_then(|qr| qr.pick(width, height - errors.len()))
+        else {
+            return false;
+        };
+        let pixels = (code.width() + QUIET * 2) * scale;
+        let rows = pixels.div_ceil(2);
+        let spare = height - errors.len() - rows;
+        const INSTRUCTIONS: &str = "Settings → Devices → Link Desktop Device";
+        let headers: &[&str] = if spare >= 2 && width >= INSTRUCTIONS.width() {
+            &["Scan with Telegram on your phone", INSTRUCTIONS]
+        } else if spare >= 1 {
+            &["Scan with Telegram"]
         } else {
-            value.to_owned()
+            &[]
         };
-        let mut lines = vec![
-            Line::from(intro),
-            Line::from(""),
-            Line::from(label),
-            Line::from(Span::styled(format!(" {shown}█"), active_style())),
-            Line::from(""),
-            hint(footer),
-        ];
-        push_error(&mut lines, self.error.as_deref());
-        lines
-    }
-
-    fn registration_lines(&self) -> Vec<Line<'static>> {
-        let row = |label: &'static str, value: &str, active: bool| {
-            let cursor = if active { "█" } else { "" };
-            let style = if active {
-                active_style()
-            } else {
-                Style::default()
-            };
-            (
-                Line::from(label),
-                Line::from(Span::styled(format!(" {value}{cursor}"), style)),
-            )
-        };
-        let (first_label, first_row) = row("First name", &self.text, !self.on_last);
-        let (last_label, last_row) = row("Last name", &self.last, self.on_last);
-        let mut lines = vec![
-            Line::from("New account"),
-            Line::from(""),
-            first_label,
-            first_row,
-            last_label,
-            last_row,
-            Line::from(""),
-            hint("tab switches fields    enter continues    ctrl-c quits"),
-        ];
-        push_error(&mut lines, self.error.as_deref());
-        lines
-    }
-
-    fn status_with_error(&self, message: &'static str) -> Vec<Line<'static>> {
-        let mut lines = status_lines(message);
-        push_error(&mut lines, self.error.as_deref());
-        lines
+        // Fit was checked above; the centered code, including quiet zone, is entirely in bounds.
+        let field = pixels
+            .max(error_width)
+            .max(usize::from(TEXT_W - 2).min(width));
+        let inner = self.card(
+            frame,
+            area,
+            (field + 2) as u16,
+            (headers.len() + rows + errors.len() + 2) as u16,
+        );
+        for (row, header) in headers.iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(*header),
+                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+            );
+        }
+        let left = inner.x + ((field - pixels) / 2) as u16;
+        let top = inner.y + headers.len() as u16;
+        let buffer = frame.buffer_mut();
+        let ink = active_style();
+        for row in 0..rows {
+            for col in 0..pixels {
+                let glyph = match (
+                    qr_dark(code, scale, col, row * 2),
+                    qr_dark(code, scale, col, row * 2 + 1),
+                ) {
+                    (true, true) => "█",
+                    (true, false) => "▀",
+                    (false, true) => "▄",
+                    (false, false) => " ",
+                };
+                buffer[(left + col as u16, top + row as u16)]
+                    .set_symbol(glyph)
+                    .set_style(ink);
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(errors),
+            Rect::new(
+                inner.x,
+                top + rows as u16,
+                inner.width,
+                inner.height - headers.len() as u16 - rows as u16,
+            ),
+        );
+        true
     }
 }
 
@@ -435,408 +432,207 @@ impl HandleFocus for LoginWindow {
 
 impl Component for LoginWindow {
     fn handle_events(&mut self, event: Option<Event>) -> Result<Option<Action>, AppError<Action>> {
-        let action = match event {
+        Ok(match event {
             Some(Event::Key(code, modifiers)) => self.on_key(code, modifiers),
             Some(Event::Paste(text)) => {
                 self.sync_auth();
                 if !self.busy {
                     self.insert_str(&text);
+                    self.app_context.mark_dirty();
                 }
                 None
             }
             _ => None,
-        };
-        Ok(action)
+        })
     }
 
     fn update(&mut self, action: Action) {
-        if matches!(*self.app_context.td_auth(), TdAuth::Ready) {
-            self.clear_secrets();
-            return;
-        }
-        if let Action::LoginFailed(message) = action {
-            self.error = Some(message);
-            self.busy = false;
-            self.app_context.mark_dirty();
+        self.sync_auth();
+        if let Action::LoginFailed(error) = action {
+            if !matches!(self.state, TdAuth::Ready) {
+                self.error = Some(error);
+                self.busy = false;
+                self.app_context.mark_dirty();
+            }
         }
     }
 
-    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> io::Result<()> {
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<()> {
         self.sync_auth();
-        let (lines, width) = match &self.state {
-            TdAuth::Starting => (
-                self.status_with_error("Connecting to Telegram…"),
-                TEXT_CARD_WIDTH,
-            ),
-            TdAuth::WaitOtherDevice { .. } => qr_card_lines(
-                self.qr.as_ref(),
-                self.error.as_deref(),
-                area.width,
-                area.height,
-            ),
-            TdAuth::WaitPhoneNumber if self.busy && !self.phone_entry => (
-                self.status_with_error("Requesting a QR code…"),
-                TEXT_CARD_WIDTH,
-            ),
-            TdAuth::WaitPhoneNumber if self.phone_entry => (
-                self.field_lines(
-                    "Phone number",
-                    "Include the country code",
-                    &self.text,
-                    false,
-                    "enter submits    esc back    ctrl-c quits",
-                ),
-                TEXT_CARD_WIDTH,
-            ),
-            TdAuth::WaitPhoneNumber => (self.menu_lines(), TEXT_CARD_WIDTH),
-            TdAuth::WaitCode => (
-                self.field_lines(
-                    "Verification code",
-                    "Code from Telegram",
-                    &self.text,
-                    false,
-                    "enter submits    ctrl-c quits",
-                ),
-                TEXT_CARD_WIDTH,
-            ),
-            TdAuth::WaitPassword => (
-                self.field_lines(
-                    "Cloud password",
-                    "Two-step verification",
-                    &self.text,
-                    true,
-                    "enter submits    ctrl-c quits",
-                ),
-                TEXT_CARD_WIDTH,
-            ),
-            TdAuth::WaitEmail => (
-                self.field_lines(
-                    "Email address",
-                    "Telegram asked for an email",
-                    &self.text,
-                    false,
-                    "enter submits    ctrl-c quits",
-                ),
-                TEXT_CARD_WIDTH,
-            ),
-            TdAuth::WaitEmailCode => (
-                self.field_lines(
-                    "Email code",
-                    "Code sent to your email",
-                    &self.text,
-                    false,
-                    "enter submits    ctrl-c quits",
-                ),
-                TEXT_CARD_WIDTH,
-            ),
-            TdAuth::WaitRegistration => (self.registration_lines(), TEXT_CARD_WIDTH),
-            TdAuth::Ready => (status_lines("Signed in"), TEXT_CARD_WIDTH),
-        };
-        self.draw_card(frame, area, lines, width);
+        if area.is_empty()
+            || (matches!(self.state, TdAuth::WaitOtherDevice { .. }) && self.draw_qr(frame, area))
+        {
+            return Ok(());
+        }
+        let lines = self.lines();
+        let width = TEXT_W.min(area.width);
+        let inner_width = usize::from(width.saturating_sub(2).max(1));
+        let height: usize = lines
+            .iter()
+            .map(|line| line.width().div_ceil(inner_width).max(1))
+            .sum();
+        let inner = self.card(
+            frame,
+            area,
+            width,
+            height.saturating_add(2).min(usize::from(area.height)) as u16,
+        );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         Ok(())
     }
 }
 
-fn status_lines(message: &'static str) -> Vec<Line<'static>> {
-    vec![Line::from(message), Line::from(""), hint("q quits")]
-}
-
-fn accept_char(field: Field, current: &str, ch: char) -> bool {
-    let len = current.chars().count();
-    match field {
-        Field::Phone => {
-            if ch.is_ascii_digit() || ch == ' ' || ch == '-' {
-                len < 32
-            } else {
-                ch == '+'
-                    && len < 32
-                    && !current.contains('+')
-                    && !current.chars().any(|cell| cell.is_ascii_digit())
-            }
-        }
-        Field::Code | Field::EmailCode => len < 16 && ch.is_ascii_alphanumeric(),
-        Field::Email => len < 128 && !ch.is_control() && !ch.is_whitespace(),
-        Field::Password | Field::Name => len < 128 && !ch.is_control(),
-    }
-}
-
-/// Black on white, so the active row stays readable on light and dark terminals.
 fn active_style() -> Style {
-    Style::default()
-        .fg(ratatui::style::Color::Black)
-        .bg(ratatui::style::Color::White)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(Color::Black).bg(Color::White)
 }
 
 fn hint(text: &'static str) -> Line<'static> {
-    Line::from(Span::styled(
-        text,
-        Style::default().add_modifier(Modifier::DIM),
-    ))
+    Line::styled(text, Style::default().add_modifier(Modifier::DIM))
 }
 
-fn push_error(lines: &mut Vec<Line<'static>>, error: Option<&str>) {
-    if let Some(message) = error {
-        lines.push(Line::from(""));
-        lines.extend(message.lines().map(|line| {
-            Line::from(Span::styled(
-                line.to_owned(),
-                Style::default().fg(ratatui::style::Color::Red),
-            ))
-        }));
-    }
-}
-
-/// QR card for the cached link. The raw link is only encoded, never printed:
-/// a small terminal gets a resize note rather than a clipped code or token.
-fn qr_card_lines(
-    cached: Option<&CachedQr>,
-    error: Option<&str>,
-    area_width: u16,
-    area_height: u16,
-) -> (Vec<Line<'static>>, u16) {
-    let inner_w = usize::from(area_width.saturating_sub(2));
-    let inner_h = usize::from(area_height.saturating_sub(2));
-    let error_rows = error.map_or(0, |message| 1 + message.lines().count());
-    let error_width = error
-        .into_iter()
-        .flat_map(str::lines)
-        .map(UnicodeWidthStr::width)
-        .max()
-        .unwrap_or(0);
-    let presets: &[(&[&str], &[&str])] = &[
-        (
-            &[
-                "Scan with Telegram on your phone",
-                "Settings → Devices → Link Desktop Device",
-                "",
-            ],
-            &["", "The code refreshes on its own.  q quits"],
-        ),
-        (&["Scan with Telegram", ""], &["", "q quits"]),
-        (&["Scan with Telegram"], &["q quits"]),
-        (&[], &["q quits"]),
-        (&[], &[]),
-    ];
-
-    if let Some(cached) = cached {
-        for (headers, footers) in presets {
-            let chrome = headers.len() + footers.len() + error_rows;
-            if chrome >= inner_h || inner_w < QR_MIN_COLS {
-                continue;
-            }
-            let Some(rows) = qr_rows(cached, inner_w, inner_h - chrome) else {
-                continue;
-            };
-            let qr_width = UnicodeWidthStr::width(rows[0].as_str());
-            let min_field = usize::from(TEXT_CARD_WIDTH.saturating_sub(2)).min(inner_w);
-            let field = qr_width.max(min_field).max(error_width).min(inner_w);
-            // Keep each QR-card line on one terminal row so wrapping cannot clip the code.
-            if error_width > field
-                || headers
-                    .iter()
-                    .chain(footers.iter())
-                    .any(|text| text.width() > field)
-            {
-                continue;
-            }
-            let mut lines = Vec::new();
-            for text in *headers {
-                lines.push(Line::from(*text));
-            }
-            let pad = field.saturating_sub(qr_width);
-            let left = pad / 2;
-            for row in rows {
-                lines.push(Line::from(Span::styled(
-                    format!("{}{row}{}", " ".repeat(left), " ".repeat(pad - left)),
-                    active_style(),
-                )));
-            }
-            for text in *footers {
-                lines.push(Line::from(*text));
-            }
-            push_error(&mut lines, error);
-            let card_width = u16::try_from(field)
-                .unwrap_or(u16::MAX)
-                .saturating_add(2)
-                .min(area_width)
-                .max(1);
-            return (lines, card_width);
-        }
-    }
-
-    resize_lines(error, area_width)
-}
-
-fn resize_lines(error: Option<&str>, area_width: u16) -> (Vec<Line<'static>>, u16) {
-    let width = TEXT_CARD_WIDTH.min(area_width).max(1);
-    let mut lines = vec![
-        Line::from("This window is too small for a QR code."),
-        Line::from(""),
-        Line::from("Make the terminal larger to sign in."),
-        Line::from(""),
-        hint("q quits"),
-    ];
-    push_error(&mut lines, error);
-    (lines, width)
-}
-
-/// Largest readable rendering wins: scale first, then the medium-error-
-/// correction encoding before the smaller low one. The quiet zone always
-/// stays four modules.
-fn qr_rows(cached: &CachedQr, max_cols: usize, max_rows: usize) -> Option<Vec<String>> {
-    for scale in (1..=QR_MAX_SCALE).rev() {
-        for code in cached.medium.iter().chain(cached.low.iter()) {
-            let pixels = code
-                .width()
-                .saturating_add(QR_QUIET.saturating_mul(2))
-                .saturating_mul(scale);
-            if pixels <= max_cols && pixels.div_ceil(2) <= max_rows {
-                return Some(paint_qr(code, scale));
-            }
-        }
-    }
-    None
-}
-
-fn paint_qr(code: &QrCode, scale: usize) -> Vec<String> {
-    let modules = code.width();
-    let pixels = modules
-        .saturating_add(QR_QUIET.saturating_mul(2))
-        .saturating_mul(scale);
-    let dark = |x: usize, y: usize| {
-        let mx = x / scale;
-        let my = y / scale;
-        mx >= QR_QUIET
-            && my >= QR_QUIET
-            && mx - QR_QUIET < modules
-            && my - QR_QUIET < modules
-            && code[(mx - QR_QUIET, my - QR_QUIET)] == QrColor::Dark
-    };
-    let mut rows = Vec::with_capacity(pixels.div_ceil(2));
-    for y in (0..pixels).step_by(2) {
-        let mut line = String::with_capacity(pixels);
-        for x in 0..pixels {
-            let top = dark(x, y);
-            let bottom = y + 1 < pixels && dark(x, y + 1);
-            line.push(match (top, bottom) {
-                (true, true) => '█',
-                (true, false) => '▀',
-                (false, true) => '▄',
-                (false, false) => ' ',
-            });
-        }
-        rows.push(line);
-    }
-    rows
+fn qr_dark(code: &QrCode, scale: usize, x: usize, y: usize) -> bool {
+    let mx = x / scale;
+    let my = y / scale;
+    mx >= QUIET
+        && my >= QUIET
+        && mx - QUIET < code.width()
+        && my - QUIET < code.width()
+        && code[(mx - QUIET, my - QUIET)] == QrColor::Dark
 }
 
 fn normalize_phone(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        if ch.is_ascii_digit() || (ch == '+' && out.is_empty()) {
-            out.push(ch);
-        }
-    }
-    out
+    let mut phone = String::with_capacity(raw.len());
+    phone.extend(raw.chars().filter(|ch| ch.is_ascii_digit() || *ch == '+'));
+    phone
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect::new(x, y, width, height)
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{qr_card_lines, qr_rows, CachedQr, LoginWindow};
+    use super::{qr_dark, CachedQr, LoginWindow};
     use crate::{
-        action::Action,
+        action::{Action, LoginRequest},
         components::{component_traits::Component, search_tests::create_test_app_context},
         event::Event,
         tg::login_phase::TdAuth,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
-    use ratatui::text::Line;
     use ratatui::{backend::TestBackend, Terminal};
-    use unicode_width::UnicodeWidthStr;
 
     const LOGIN_LINK: &str = "tg://login?token=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJK";
-
-    fn line_string(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
 
     fn has_blocks(text: &str) -> bool {
         text.contains('█') || text.contains('▀') || text.contains('▄')
     }
 
-    fn is_qr(line: &Line<'_>) -> bool {
-        has_blocks(&line_string(line))
+    fn render(login: &mut LoginWindow, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| login.draw(frame, frame.area()).unwrap())
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn visible(login: &mut LoginWindow, width: u16, height: u16) -> String {
+        buffer_text(&render(login, width, height))
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn qr_state(link: &str) -> (std::sync::Arc<crate::app_context::AppContext>, LoginWindow) {
+        let context = create_test_app_context();
+        *context.td_auth() = TdAuth::WaitOtherDevice { link: link.into() };
+        let login = LoginWindow::new(context.clone());
+        (context, login)
     }
 
     #[test]
     fn qr_fits_a_classic_terminal() {
-        let cached = CachedQr::fresh(LOGIN_LINK);
-        let (lines, card_width) = qr_card_lines(Some(&cached), None, 80, 24);
-        let rows: Vec<_> = lines.iter().filter(|line| is_qr(line)).collect();
-        assert!(!rows.is_empty());
-        assert!(card_width <= 80);
-        assert!(lines.len() + 2 <= 24);
-        let width = UnicodeWidthStr::width(line_string(rows[0]).as_str());
-        assert!(rows
+        let (_context, mut login) = qr_state(LOGIN_LINK);
+        let buffer = render(&mut login, 80, 24);
+        let text = buffer_text(&buffer);
+        assert!(has_blocks(&text));
+        assert!(!text.contains("tg://"));
+        for cell in buffer
+            .content
             .iter()
-            .all(|line| UnicodeWidthStr::width(line_string(line).as_str()) == width));
-        assert!(width + 2 <= 80);
-        assert!(lines
-            .iter()
-            .all(|line| !line_string(line).contains("tg://")));
+            .filter(|cell| has_blocks(cell.symbol()))
+        {
+            assert_eq!(cell.fg, ratatui::style::Color::Black);
+            assert_eq!(cell.bg, ratatui::style::Color::White);
+        }
     }
 
     #[test]
     fn qr_keeps_four_module_quiet_zone() {
         let cached = CachedQr::fresh(LOGIN_LINK);
-        let rows = qr_rows(&cached, 80, 22).expect("qr");
-        assert!(!has_blocks(&rows[0]));
-        assert!(!has_blocks(&rows[1]));
-        assert!(!has_blocks(&rows[rows.len() - 1]));
-        assert!(!has_blocks(&rows[rows.len() - 2]));
-        assert!(rows
-            .iter()
-            .all(|row| row.starts_with("    ") && row.ends_with("    ")));
-    }
-
-    #[test]
-    fn tiny_terminal_shows_resize_instead_of_code() {
-        let cached = CachedQr::fresh(LOGIN_LINK);
-        for (width, height) in [(30, 12), (80, 10)] {
-            let (lines, card_width) = qr_card_lines(Some(&cached), None, width, height);
-            assert!(lines.iter().all(|line| !is_qr(line)));
-            assert!(lines
-                .iter()
-                .all(|line| !line_string(line).contains("tg://")));
-            assert!(card_width <= width);
+        let (code, scale) = cached.pick(80, 22).expect("qr fits");
+        let pixels = code
+            .width()
+            .saturating_add(super::QUIET * 2)
+            .saturating_mul(scale);
+        for x in 0..pixels {
+            for y in 0..super::QUIET * scale {
+                assert!(!qr_dark(code, scale, x, y));
+                assert!(!qr_dark(code, scale, x, pixels - 1 - y));
+            }
+        }
+        for y in 0..pixels {
+            for x in 0..super::QUIET * scale {
+                assert!(!qr_dark(code, scale, x, y));
+                assert!(!qr_dark(code, scale, pixels - 1 - x, y));
+            }
         }
     }
 
     #[test]
-    fn qr_card_reserves_space_for_wide_multiline_errors() {
-        let cached = CachedQr::fresh(LOGIN_LINK);
-        let error = format!("{}\nAdditional detail", "x".repeat(60));
-        let (lines, width) = qr_card_lines(Some(&cached), Some(&error), 80, 30);
-        assert!(lines.iter().any(is_qr));
-        assert!(lines
+    fn tiny_and_zero_terminals_show_resize_instead_of_code() {
+        let (_context, mut login) = qr_state(LOGIN_LINK);
+        for (width, height) in [(30, 12), (80, 10), (20, 8), (1, 1)] {
+            let text = visible(&mut login, width, height);
+            assert!(!has_blocks(&text), "unexpected code at {width}x{height}");
+            assert!(!text.contains("tg://"));
+        }
+        // An explicit zero-area draw is a no-op, never a panic.
+        let mut terminal = Terminal::new(TestBackend::new(10, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                login
+                    .draw(frame, ratatui::layout::Rect::new(0, 0, 0, 0))
+                    .unwrap();
+            })
+            .unwrap();
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
             .iter()
-            .all(|line| line.width() <= usize::from(width - 2)));
-        assert!(lines.len() + 2 <= 30);
+            .all(|cell| cell.symbol() == " "));
+    }
 
-        let (lines, _) = qr_card_lines(Some(&cached), Some(&error), 80, 24);
-        assert!(lines.iter().all(|line| !is_qr(line)));
+    #[test]
+    fn qr_wide_multiline_error_falls_back_to_resize_note() {
+        let (_context, mut login) = qr_state(LOGIN_LINK);
+        // Sync to the QR step, then fail with a wide two-line error.
+        visible(&mut login, 80, 24);
+        let error = format!("{}\nAdditional detail", "x".repeat(60));
+        login.update(Action::LoginFailed(error));
+        assert!(has_blocks(&visible(&mut login, 80, 30)));
+        let small = visible(&mut login, 80, 24);
+        assert!(!has_blocks(&small));
+        assert!(small.contains("Additional detail"));
     }
 
     #[test]
@@ -846,13 +642,13 @@ mod tests {
         let mut login = LoginWindow::new(context);
         assert!(matches!(
             login.on_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Action::LoginSelectQr)
+            Some(Action::Login(LoginRequest::Qr))
         ));
         assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
         login.update(Action::LoginFailed("Request rejected".into()));
         assert!(matches!(
             login.on_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Action::LoginSelectQr)
+            Some(Action::Login(LoginRequest::Qr))
         ));
     }
 
@@ -865,21 +661,57 @@ mod tests {
         login
             .handle_events(Some(Event::Paste(password.into())))
             .unwrap();
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| login.draw(frame, frame.area()).unwrap())
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let visible: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-        assert!(!visible.contains("secret"));
-        assert!(visible.contains(&"•".repeat(password.chars().count())));
+        let text = visible(&mut login, 80, 24);
+        assert!(!text.contains("secret"));
+        assert!(text.contains(&"•".repeat(password.chars().count())));
         assert!(matches!(
             login.on_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Action::LoginSubmitPassword(value)) if value == password
+            Some(Action::Login(LoginRequest::Password(value))) if value == password
         ));
         *context.td_auth() = TdAuth::Ready;
-        login.clear_secrets();
+        login.update(Action::Refresh);
         *context.td_auth() = TdAuth::WaitPassword;
         assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
+    }
+
+    #[test]
+    fn auth_transition_before_failure_keeps_new_error() {
+        let context = create_test_app_context();
+        *context.td_auth() = TdAuth::WaitCode;
+        let mut login = LoginWindow::new(context.clone());
+        visible(&mut login, 80, 24);
+        login.insert_str("12345");
+        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_some());
+        // TDLib advances before the failure arrives; the error belongs to the new step.
+        *context.td_auth() = TdAuth::WaitPassword;
+        login.update(Action::LoginFailed("Bad password".into()));
+        assert!(matches!(login.state, TdAuth::WaitPassword));
+        assert_eq!(login.error.as_deref(), Some("Bad password"));
+        assert!(!login.busy);
+    }
+
+    #[test]
+    fn registration_preserves_both_fields_across_validation_and_focus_changes() {
+        let context = create_test_app_context();
+        *context.td_auth() = TdAuth::WaitRegistration;
+        let mut login = LoginWindow::new(context);
+        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
+        login
+            .handle_events(Some(Event::Paste(" Last \n".into())))
+            .unwrap();
+        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
+        assert!(!login.busy);
+        login.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        login
+            .handle_events(Some(Event::Paste(" Élodie ".into())))
+            .unwrap();
+        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
+        assert_eq!(
+            login.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Action::Login(LoginRequest::Registration {
+                first: "Élodie".into(),
+                last: "Last".into(),
+            })),
+        );
     }
 }

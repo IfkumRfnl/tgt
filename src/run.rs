@@ -131,7 +131,6 @@ async fn run_cli_session(
             Ok(false) => {}
             Err(error) => {
                 tg_backend.close().await;
-                tg_backend.drain_until_closed().await;
                 return Err(
                     io::Error::other(format!("Sign-in setup failed: {}", error.message)).into(),
                 );
@@ -147,13 +146,12 @@ async fn run_cli_session(
         if needs_login {
             println!("Not signed in. Run tgt to sign in, then retry this command.");
             tg_backend.close().await;
-            tg_backend.drain_until_closed().await;
             return Ok(());
         }
     }
     boot_session(Arc::clone(&app_context), tg_backend).await;
     match handle_cli(app_context, tg_backend).await {
-        HandleCliOutcome::Quit | HandleCliOutcome::Continue => quit_cli(tg_backend).await,
+        HandleCliOutcome::Quit | HandleCliOutcome::Continue => tg_backend.close().await,
         HandleCliOutcome::Logout => {
             tg_backend.log_out().await;
             tg_backend.drain_until_closed().await;
@@ -526,17 +524,8 @@ pub async fn handle_app_actions(
     for action in folded {
         // Sign-in submissions move into the background TDLib task; failures return
         // as LoginFailed, which still fans out below so the card can show the error.
-        if matches!(
-            action,
-            Action::LoginSelectQr
-                | Action::LoginSubmitPhone(_)
-                | Action::LoginSubmitCode(_)
-                | Action::LoginSubmitPassword(_)
-                | Action::LoginSubmitEmail(_)
-                | Action::LoginSubmitEmailCode(_)
-                | Action::LoginSubmitRegistration { .. }
-        ) {
-            tg_backend.submit_login(action);
+        if let Action::Login(request) = action {
+            tg_backend.submit_login(request);
             app_context.mark_dirty();
             continue;
         }
@@ -1194,23 +1183,8 @@ async fn quit_tui(tg_backend: &mut TgBackend, tui_backend: &mut TuiBackend) {
         tg_backend.offline().await;
     }
     tg_backend.close().await;
-    tg_backend.drain_until_closed().await;
-
-    // Clear the terminal and move the cursor to the top left corner
-    io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
 }
 
-/// Quit the cli.
-///
-/// # Arguments
-/// * `tg_backend` - A mutable reference to the TgBackend struct.
-async fn quit_cli(tg_backend: &mut TgBackend) {
-    tg_backend.close().await;
-    tg_backend.drain_until_closed().await;
-
-    // Clear the terminal and move the cursor to the top left corner
-    io::Write::write_all(&mut io::stdout().lock(), b"\x1b[2J\x1b[1;1H").unwrap();
-}
 #[cfg(test)]
 mod fold_action_tests {
     use super::{fold_chat_list_refresh_actions, Action};
