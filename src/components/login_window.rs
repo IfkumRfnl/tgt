@@ -36,15 +36,18 @@ impl CachedQr {
     }
 
     fn pick(&self, width: usize, height: usize) -> Option<(&QrCode, usize)> {
-        for scale in (1..=3).rev() {
-            for code in self.medium.iter().chain(self.low.iter()) {
-                let pixels = (code.width() + QUIET * 2) * scale;
-                if pixels <= width && pixels.div_ceil(2) <= height {
-                    return Some((code, scale));
-                }
-            }
-        }
-        None
+        // max_by_key keeps the last equal candidate, so medium wins ties.
+        self.low
+            .iter()
+            .chain(self.medium.iter())
+            .filter_map(|code| {
+                let modules = code.width() + QUIET * 2;
+                let scale = (width / modules)
+                    .min(height.saturating_mul(2) / modules)
+                    .min(3);
+                (scale > 0).then_some((code, scale))
+            })
+            .max_by_key(|(_, scale)| *scale)
     }
 }
 
