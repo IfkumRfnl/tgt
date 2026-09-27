@@ -2,7 +2,10 @@ use {
     super::component_name::ComponentName,
     crate::{
         app_error::AppError,
-        tg::td_enums::{TdChatList, TdMessageReplyToMessage},
+        tg::{
+            login_phase::TdAuth,
+            td_enums::{TdChatList, TdMessageReplyToMessage},
+        },
     },
     crossterm::event::{KeyCode, KeyModifiers},
     ratatui::layout::Rect,
@@ -355,6 +358,8 @@ pub enum Action {
     Login(LoginRequest),
     /// A sign-in request was rejected. The card shows `message`.
     LoginFailed(String),
+    /// Latest TDLib authorization step; routed only to the login card.
+    Authorization(TdAuth),
 }
 /// Implement the `Action` enum.
 impl Action {

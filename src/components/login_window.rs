@@ -51,15 +51,28 @@ impl CachedQr {
     }
 }
 
+/// Cursor position inside the sign-in card. [`TdAuth`] still decides which
+/// form is shown; this only tracks where the cursor is within that form.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Mode {
+    /// Sign-in menu with the QR option highlighted.
+    #[default]
+    QrChoice,
+    /// Sign-in menu with the phone option highlighted.
+    PhoneChoice,
+    /// Typing in the visible field (first name for a new account).
+    Input,
+    /// Typing the last name for a new account.
+    LastName,
+}
+
 /// TDLib owns the authorization step; the component owns input and presentation.
 pub struct LoginWindow {
     app_context: Arc<AppContext>,
     state: TdAuth,
+    mode: Mode,
     text: String,
     last: String,
-    on_last: bool,
-    qr_selected: bool,
-    phone_entry: bool,
     busy: bool,
     error: Option<String>,
     qr: Option<CachedQr>,
@@ -70,137 +83,81 @@ impl LoginWindow {
         Self {
             app_context,
             state: TdAuth::Starting,
+            mode: Mode::default(),
             text: String::new(),
             last: String::new(),
-            on_last: false,
-            qr_selected: true,
-            phone_entry: false,
             busy: false,
             error: None,
             qr: None,
         }
     }
 
-    fn sync_auth(&mut self) {
-        let state = {
-            let state = self.app_context.td_auth();
-            if *state == self.state {
-                return;
-            }
-            state.clone()
-        };
-        // Drop credential buffers on every transition, including Ready.
-        self.text = String::new();
-        self.last = String::new();
-        self.on_last = false;
-        self.phone_entry = false;
-        self.busy = false;
-        self.error = None;
-        self.qr = match &state {
+    /// True once TDLib reports the session authorized; the shell replaces the card.
+    pub fn is_authorized(&self) -> bool {
+        matches!(self.state, TdAuth::Ready)
+    }
+
+    /// Move the latest authorization step in. Identical repeats keep typed
+    /// input and focus; a new link re-encodes the QR cache.
+    fn apply_auth(&mut self, state: TdAuth) {
+        if state == self.state {
+            return;
+        }
+        let qr = match &state {
             TdAuth::WaitOtherDevice { link } => Some(CachedQr::fresh(link)),
             _ => None,
         };
         self.state = state;
+        self.mode = match self.state {
+            TdAuth::WaitPhoneNumber => Mode::QrChoice,
+            TdAuth::WaitCode
+            | TdAuth::WaitPassword
+            | TdAuth::WaitEmail
+            | TdAuth::WaitEmailCode
+            | TdAuth::WaitRegistration => Mode::Input,
+            TdAuth::Starting | TdAuth::WaitOtherDevice { .. } | TdAuth::Ready => Mode::QrChoice,
+        };
+        self.text = String::new();
+        self.last = String::new();
+        self.busy = false;
+        self.error = None;
+        self.qr = qr;
+        self.app_context.mark_dirty();
     }
 
     fn editing(&self) -> bool {
         match self.state {
-            TdAuth::WaitPhoneNumber => self.phone_entry,
+            TdAuth::WaitPhoneNumber => self.mode == Mode::Input,
             TdAuth::Starting | TdAuth::WaitOtherDevice { .. } | TdAuth::Ready => false,
             _ => true,
         }
     }
 
+    /// Append typed or pasted text verbatim. A paste containing controls or
+    /// line breaks is rejected as a whole with a visible error; an empty
+    /// insertion keeps any prior error.
     fn insert_str(&mut self, text: &str) {
-        if !self.editing() {
+        if !self.editing() || text.is_empty() {
             return;
         }
-        let input = if self.on_last {
-            &mut self.last
+        if text
+            .chars()
+            .any(|ch| ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}')
+        {
+            self.error = Some("Line breaks and control characters are not allowed.".into());
+            return;
+        }
+        if self.mode == Mode::LastName {
+            self.last.push_str(text);
         } else {
-            &mut self.text
-        };
-        let mut len = input.chars().count();
-        for ch in text.chars() {
-            let accepted = match self.state {
-                TdAuth::WaitPhoneNumber => {
-                    len < 32
-                        && (ch.is_ascii_digit()
-                            || matches!(ch, ' ' | '-')
-                            || (ch == '+'
-                                && !input.contains('+')
-                                && !input.chars().any(|ch| ch.is_ascii_digit())))
-                }
-                TdAuth::WaitCode | TdAuth::WaitEmailCode => len < 16 && ch.is_ascii_alphanumeric(),
-                TdAuth::WaitEmail => len < 128 && !ch.is_control() && !ch.is_whitespace(),
-                _ => len < 128 && !ch.is_control(),
-            };
-            if accepted {
-                input.push(ch);
-                len += 1;
-            }
+            self.text.push_str(text);
         }
         self.error = None;
     }
 
-    fn on_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
-        self.sync_auth();
-        let menu = matches!(self.state, TdAuth::WaitPhoneNumber) && !self.phone_entry;
-        let editing = self.editing();
-        if (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'q')))
-            || (matches!(code, KeyCode::Esc | KeyCode::Char('q')) && !editing)
-        {
-            return Some(Action::Quit);
-        }
-        if self.busy {
-            return None;
-        }
-        self.app_context.mark_dirty();
-        if menu {
-            match code {
-                KeyCode::Up => self.qr_selected = true,
-                KeyCode::Down => self.qr_selected = false,
-                KeyCode::Enter if self.qr_selected => {
-                    self.busy = true;
-                    self.error = None;
-                    return Some(Action::Login(LoginRequest::Qr));
-                }
-                KeyCode::Enter => {
-                    self.phone_entry = true;
-                    self.text.clear();
-                    self.error = None;
-                }
-                _ => {}
-            }
-        } else if editing {
-            match code {
-                KeyCode::Esc if self.phone_entry => {
-                    self.phone_entry = false;
-                    self.qr_selected = false;
-                    self.error = None;
-                }
-                KeyCode::Char(ch) => self.insert_str(ch.encode_utf8(&mut [0; 4])),
-                KeyCode::Backspace => {
-                    if self.on_last {
-                        self.last.pop();
-                    } else {
-                        self.text.pop();
-                    }
-                    self.error = None;
-                }
-                KeyCode::Tab if matches!(self.state, TdAuth::WaitRegistration) => {
-                    self.on_last = !self.on_last;
-                }
-                KeyCode::Enter => return self.submit(),
-                _ => {}
-            }
-        }
-        None
-    }
-
     fn submit(&mut self) -> Option<Action> {
-        if matches!(self.state, TdAuth::WaitRegistration) && !self.on_last {
-            self.on_last = true;
+        if matches!(self.state, TdAuth::WaitRegistration) && self.mode == Mode::Input {
+            self.mode = Mode::LastName;
             return None;
         }
         let value = if matches!(self.state, TdAuth::WaitPassword) {
@@ -209,15 +166,7 @@ impl LoginWindow {
             self.text.trim()
         };
         let error = match self.state {
-            TdAuth::WaitPhoneNumber
-                if value
-                    .chars()
-                    .filter(|ch| ch.is_ascii_digit() || *ch == '+')
-                    .count()
-                    < 5 =>
-            {
-                Some("Include the country code, for example +1…")
-            }
+            TdAuth::WaitPhoneNumber => phone_error(value),
             TdAuth::WaitEmail if !value.contains('@') => Some("Enter an email address."),
             _ if value.is_empty() => Some("This field is required."),
             _ => None,
@@ -246,14 +195,14 @@ impl LoginWindow {
     fn lines(&self) -> Vec<Line<'_>> {
         let mut lines = match self.state {
             TdAuth::Starting => vec![Line::from("Connecting to Telegram…"), hint("q quits")],
-            TdAuth::WaitPhoneNumber if !self.phone_entry => {
+            TdAuth::WaitPhoneNumber if self.mode != Mode::Input => {
                 if self.busy {
                     vec![Line::from("Requesting a QR code…"), hint("q quits")]
                 } else {
                     let mut lines = vec![Line::from("Choose how to sign in"), Line::default()];
                     for (selected, label) in [
-                        (self.qr_selected, "Log in with a QR code"),
-                        (!self.qr_selected, "Log in with a phone number"),
+                        (self.mode == Mode::QrChoice, "Log in with a QR code"),
+                        (self.mode == Mode::PhoneChoice, "Log in with a phone number"),
                     ] {
                         lines.push(Line::from(Span::styled(
                             format!(" {}  {label}", if selected { ">" } else { " " }),
@@ -291,8 +240,8 @@ impl LoginWindow {
                 let registration = matches!(self.state, TdAuth::WaitRegistration);
                 let mut lines = vec![Line::from(title), Line::default()];
                 let fields = [
-                    (label, &self.text, !self.on_last),
-                    ("Last name", &self.last, self.on_last),
+                    (label, &self.text, self.mode != Mode::LastName),
+                    ("Last name", &self.last, self.mode == Mode::LastName),
                 ];
                 for (label, value, selected) in
                     fields.into_iter().take(if registration { 2 } else { 1 })
@@ -319,7 +268,7 @@ impl LoginWindow {
                 lines.push(Line::default());
                 lines.push(hint(if registration {
                     "tab switches fields    enter continues    ctrl-c quits"
-                } else if self.phone_entry {
+                } else if matches!(self.state, TdAuth::WaitPhoneNumber) {
                     "enter submits    esc back    ctrl-c quits"
                 } else {
                     "enter submits    ctrl-c quits"
@@ -435,33 +384,97 @@ impl HandleFocus for LoginWindow {
 
 impl Component for LoginWindow {
     fn handle_events(&mut self, event: Option<Event>) -> Result<Option<Action>, AppError<Action>> {
-        Ok(match event {
-            Some(Event::Key(code, modifiers)) => self.on_key(code, modifiers),
+        match event {
+            Some(Event::Key(code, modifiers)) => {
+                let editing = self.editing();
+                let menu = matches!(self.state, TdAuth::WaitPhoneNumber)
+                    && matches!(self.mode, Mode::QrChoice | Mode::PhoneChoice);
+                if (modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, KeyCode::Char('c' | 'C' | 'q' | 'Q')))
+                    || (matches!(code, KeyCode::Esc | KeyCode::Char('q')) && !editing)
+                {
+                    return Ok(Some(Action::Quit));
+                }
+                if self.busy {
+                    return Ok(None);
+                }
+                // Ignore Ctrl-modified printable keys instead of inserting their base letter.
+                if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char(_)) {
+                    return Ok(None);
+                }
+                self.app_context.mark_dirty();
+                if menu {
+                    match code {
+                        KeyCode::Up => self.mode = Mode::QrChoice,
+                        KeyCode::Down => self.mode = Mode::PhoneChoice,
+                        KeyCode::Enter if self.mode == Mode::QrChoice => {
+                            self.busy = true;
+                            self.error = None;
+                            return Ok(Some(Action::Login(LoginRequest::Qr)));
+                        }
+                        KeyCode::Enter => {
+                            self.mode = Mode::Input;
+                            self.error = None;
+                        }
+                        _ => {}
+                    }
+                } else if editing {
+                    match code {
+                        KeyCode::Esc if matches!(self.state, TdAuth::WaitPhoneNumber) => {
+                            self.mode = Mode::PhoneChoice;
+                            self.error = None;
+                        }
+                        KeyCode::Char(ch) => {
+                            let mut buf = [0; 4];
+                            self.insert_str(ch.encode_utf8(&mut buf));
+                        }
+                        KeyCode::Backspace => {
+                            let popped = if self.mode == Mode::LastName {
+                                self.last.pop()
+                            } else {
+                                self.text.pop()
+                            };
+                            if popped.is_some() {
+                                self.error = None;
+                            }
+                        }
+                        KeyCode::Tab if matches!(self.state, TdAuth::WaitRegistration) => {
+                            self.mode = if self.mode == Mode::LastName {
+                                Mode::Input
+                            } else {
+                                Mode::LastName
+                            };
+                        }
+                        KeyCode::Enter => return Ok(self.submit()),
+                        _ => {}
+                    }
+                }
+                Ok(None)
+            }
             Some(Event::Paste(text)) => {
-                self.sync_auth();
                 if !self.busy {
                     self.insert_str(&text);
                     self.app_context.mark_dirty();
                 }
-                None
+                Ok(None)
             }
-            _ => None,
-        })
+            _ => Ok(None),
+        }
     }
 
     fn update(&mut self, action: Action) {
-        self.sync_auth();
-        if let Action::LoginFailed(error) = action {
-            if !matches!(self.state, TdAuth::Ready) {
+        match action {
+            Action::Authorization(state) => self.apply_auth(state),
+            Action::LoginFailed(error) if !self.is_authorized() => {
                 self.error = Some(error);
                 self.busy = false;
                 self.app_context.mark_dirty();
             }
+            _ => {}
         }
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) -> io::Result<()> {
-        self.sync_auth();
         if area.is_empty()
             || (matches!(self.state, TdAuth::WaitOtherDevice { .. }) && self.draw_qr(frame, area))
         {
@@ -503,9 +516,23 @@ fn qr_dark(code: &QrCode, scale: usize, x: usize, y: usize) -> bool {
         && code[(mx - QUIET, my - QUIET)] == QrColor::Dark
 }
 
+/// Validate phone syntax before removing visual separators; TDLib validates the number.
+fn phone_error(value: &str) -> Option<&'static str> {
+    let mut has_digit = false;
+    for ch in value.strip_prefix('+').unwrap_or(value).chars() {
+        match ch {
+            '0'..='9' => has_digit = true,
+            ' ' | '-' => {}
+            _ => return Some("Use digits, spaces or hyphens, with an optional leading +."),
+        }
+    }
+    (!has_digit).then_some("Enter a phone number.")
+}
+
+/// Drop only visual separators; validation above already rejected anything else.
 fn normalize_phone(raw: &str) -> String {
     let mut phone = String::with_capacity(raw.len());
-    phone.extend(raw.chars().filter(|ch| ch.is_ascii_digit() || *ch == '+'));
+    phone.extend(raw.chars().filter(|ch| !matches!(ch, ' ' | '-')));
     phone
 }
 
@@ -534,6 +561,10 @@ mod tests {
 
     const LOGIN_LINK: &str = "tg://login?token=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJK";
 
+    fn key(code: KeyCode) -> Option<Event> {
+        Some(Event::Key(code, KeyModifiers::NONE))
+    }
+
     #[test]
     fn qr_keeps_four_module_quiet_zone() {
         let cached = CachedQr::fresh(LOGIN_LINK);
@@ -556,26 +587,24 @@ mod tests {
 
     #[test]
     fn qr_request_waits_for_response_and_can_retry_after_failure() {
-        let context = create_test_app_context();
-        *context.td_auth() = TdAuth::WaitPhoneNumber;
-        let mut login = LoginWindow::new(context);
+        let mut login = LoginWindow::new(create_test_app_context());
+        login.update(Action::Authorization(TdAuth::WaitPhoneNumber));
         assert!(matches!(
-            login.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            login.handle_events(key(KeyCode::Enter)).unwrap(),
             Some(Action::Login(LoginRequest::Qr))
         ));
-        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
+        assert!(login.handle_events(key(KeyCode::Enter)).unwrap().is_none());
         login.update(Action::LoginFailed("Request rejected".into()));
         assert!(matches!(
-            login.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            login.handle_events(key(KeyCode::Enter)).unwrap(),
             Some(Action::Login(LoginRequest::Qr))
         ));
     }
 
     #[test]
     fn password_is_masked_submitted_verbatim_and_cleared_after_ready() {
-        let context = create_test_app_context();
-        *context.td_auth() = TdAuth::WaitPassword;
-        let mut login = LoginWindow::new(context.clone());
+        let mut login = LoginWindow::new(create_test_app_context());
+        login.update(Action::Authorization(TdAuth::WaitPassword));
         let password = " secret with spaces ";
         login
             .handle_events(Some(Event::Paste(password.into())))
@@ -594,12 +623,11 @@ mod tests {
         assert!(!text.contains("secret"));
         assert!(text.contains(&"•".repeat(password.chars().count())));
         assert!(matches!(
-            login.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            login.handle_events(key(KeyCode::Enter)).unwrap(),
             Some(Action::Login(LoginRequest::Password(value))) if value == password
         ));
-        *context.td_auth() = TdAuth::Ready;
-        login.update(Action::Refresh);
-        *context.td_auth() = TdAuth::WaitPassword;
-        assert!(login.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
+        login.update(Action::Authorization(TdAuth::Ready));
+        login.update(Action::Authorization(TdAuth::WaitPassword));
+        assert!(login.handle_events(key(KeyCode::Enter)).unwrap().is_none());
     }
 }

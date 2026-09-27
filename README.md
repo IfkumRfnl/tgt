@@ -82,9 +82,12 @@ QR-code or phone-number login.
   if the code cannot fit; login links are encoded locally, not sent to a QR service.
 - **Phone number:** Include your country code, then enter the verification code
   Telegram sends. Escape returns from the phone-number field to the menu before
-  submission.
+  submission. Spaces and hyphens are accepted; invalid characters are reported on
+  submission rather than silently removed.
 - Telegram may also ask for your cloud password, email verification, or account
   name. Password input is masked. **Ctrl+C** exits any sign-in step.
+- Printable input is preserved without local length limits. Pastes containing line
+  breaks or control characters are rejected in full with a visible error.
 
 CLI commands that require a session do not prompt for credentials. Sign in with
 `tgt` first, then retry the command.

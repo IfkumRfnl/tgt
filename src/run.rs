@@ -9,8 +9,14 @@ use crate::{
     tui::Tui,
     tui_backend::TuiBackend,
 };
-use ratatui::layout::Rect;
-use std::{collections::HashMap, io, sync::Arc, time::Duration, time::Instant};
+use ratatui::{backend::Backend, layout::Rect};
+use std::{
+    collections::HashMap,
+    io,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+    time::Instant,
+};
 use tdlib_rs::enums::ChatList;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -56,7 +62,8 @@ pub async fn run_app(
 
     let result = async {
         tui_backend.enter()?;
-        tui_backend.terminal.clear()?;
+        // Buffers are still empty. Clear without a cursor query competing with EventStream.
+        tui_backend.terminal.backend_mut().clear()?;
         tui.register_action_handler(app_context.action_tx().clone())?;
         app_context.set_focused_component(Some(ComponentName::Login));
         app_context.mark_dirty();
@@ -90,7 +97,14 @@ pub async fn run_app(
                 _ = tg_wake_rx.recv() => {}
                 _ = voice_wake_rx.recv() => {}
             }
-            if drain_auth_states(Arc::clone(&app_context), tg_backend, &mut session_booted).await {
+            if drain_auth_states(
+                Arc::clone(&app_context),
+                tui,
+                tg_backend,
+                &mut session_booted,
+            )
+            .await
+            {
                 break;
             }
             while let Some(ev) = tui_backend.try_next() {
@@ -106,7 +120,7 @@ pub async fn run_app(
     }
     .await;
 
-    quit_tui(tg_backend, tui_backend).await;
+    quit_tui(tg_backend, tui_backend, tui.is_authorized()).await;
     tracing::info!("Quitting");
     result
 }
@@ -126,24 +140,23 @@ async fn run_cli_session(
         let Some(state) = tg_backend.auth_rx.recv().await else {
             return Ok(());
         };
-        match tg_backend.apply_auth_state(state).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+        let auth = match tg_backend.apply_auth_state(state).await {
+            Ok(Some(auth)) => auth,
+            Ok(None) => continue,
             Err(error) => {
                 tg_backend.close().await;
                 return Err(
                     io::Error::other(format!("Sign-in setup failed: {}", error.message)).into(),
                 );
             }
-        }
-        let (ready, needs_login) = {
-            let auth = app_context.td_auth();
-            (matches!(*auth, TdAuth::Ready), auth.needs_user())
         };
-        if ready {
+        if tg_backend.can_quit.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if matches!(auth, TdAuth::Ready) {
             break;
         }
-        if needs_login {
+        if auth.needs_user() {
             println!("Not signed in. Run tgt to sign in, then retry this command.");
             tg_backend.close().await;
             return Ok(());
@@ -163,16 +176,20 @@ async fn run_cli_session(
 /// Drain authorization updates before input/rendering so only the newest QR is drawn.
 async fn drain_auth_states(
     app_context: Arc<AppContext>,
+    tui: &mut Tui,
     tg_backend: &mut TgBackend,
     session_booted: &mut bool,
 ) -> bool {
     while let Ok(state) = tg_backend.auth_rx.try_recv() {
         match tg_backend.apply_auth_state(state).await {
-            Ok(true) => {
-                app_context.quit_store(true);
-                return true;
+            Ok(Some(auth)) => {
+                tui.update(Action::Authorization(auth));
+                if tg_backend.can_quit.load(Ordering::Acquire) {
+                    app_context.quit_store(true);
+                    return true;
+                }
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(error) => {
                 let _ = app_context.action_tx().send(Action::LoginFailed(format!(
                     "Sign-in setup failed: {}",
@@ -181,8 +198,7 @@ async fn drain_auth_states(
             }
         }
     }
-    let ready = matches!(*app_context.td_auth(), TdAuth::Ready);
-    if !*session_booted && ready {
+    if !*session_booted && tui.is_authorized() {
         boot_session(Arc::clone(&app_context), tg_backend).await;
         *session_booted = true;
     }
@@ -1176,10 +1192,10 @@ async fn handle_cli(app_context: Arc<AppContext>, tg_backend: &mut TgBackend) ->
 /// # Arguments
 /// * `tg_backend` - A mutable reference to the TgBackend struct.
 /// * `tui_backend` - A mutable reference to the TuiBackend struct.
-async fn quit_tui(tg_backend: &mut TgBackend, tui_backend: &mut TuiBackend) {
+/// * `authorized` - Whether the session is currently authorized.
+async fn quit_tui(tg_backend: &mut TgBackend, tui_backend: &mut TuiBackend, authorized: bool) {
     tui_backend.exit();
-    let ready = matches!(*tg_backend.app_context.td_auth(), TdAuth::Ready);
-    if ready {
+    if authorized {
         tg_backend.offline().await;
     }
     tg_backend.close().await;

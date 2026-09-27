@@ -593,12 +593,13 @@ impl TgBackend {
         }
     }
 
-    /// Apply an authorization update; return true when the client has closed.
+    /// Map a TDLib authorization update to the owned UI state.
+    /// Returns `None` when the update produces no new UI state.
+    /// `Closed` sets `can_quit` and yields `Starting`.
     pub async fn apply_auth_state(
         &self,
         state: AuthorizationState,
-    ) -> Result<bool, tdlib_rs::types::Error> {
-        let closed = matches!(state, AuthorizationState::Closed);
+    ) -> Result<Option<TdAuth>, tdlib_rs::types::Error> {
         let auth = match state {
             AuthorizationState::WaitPhoneNumber => TdAuth::WaitPhoneNumber,
             AuthorizationState::WaitOtherDeviceConfirmation(confirmation) => {
@@ -614,7 +615,7 @@ impl TgBackend {
             AuthorizationState::Ready => TdAuth::Ready,
             AuthorizationState::WaitTdlibParameters => {
                 self.apply_tdlib_parameters().await?;
-                return Ok(false);
+                return Ok(None);
             }
             AuthorizationState::LoggingOut | AuthorizationState::Closing => TdAuth::Starting,
             AuthorizationState::Closed => {
@@ -623,13 +624,11 @@ impl TgBackend {
             }
             AuthorizationState::WaitPremiumPurchase(_) => {
                 tracing::info!("Waiting for premium purchase confirmation");
-                return Ok(false);
+                return Ok(None);
             }
         };
         tracing::debug!("TDLib authorization step: {auth:?}");
-        *self.app_context.td_auth() = auth;
-        self.app_context.mark_dirty();
-        Ok(closed)
+        Ok(Some(auth))
     }
 
     /// Wait for TDLib to close, bounded in case the client stops responding.
@@ -650,8 +649,6 @@ impl TgBackend {
         {
             tracing::warn!("Timed out waiting for TDLib to close");
         }
-        *self.app_context.td_auth() = TdAuth::Starting;
-        self.app_context.mark_dirty();
         self.can_quit.store(true, Ordering::Release);
     }
 

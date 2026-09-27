@@ -6,7 +6,7 @@ use crate::{
         app_custom::AppConfig, keymap_custom::KeymapConfig, palette_custom::PaletteConfig,
         telegram_custom::TelegramConfig, theme_custom::ThemeConfig,
     },
-    tg::{login_phase::TdAuth, tg_context::TgContext},
+    tg::tg_context::TgContext,
 };
 use parking_lot::{Mutex, MutexGuard};
 use ratatui::style::Style;
@@ -96,8 +96,6 @@ pub struct AppContext {
     /// The currently focused UI component, used for context-aware keymap lookup in the run loop.
     /// Uses AtomicU8 for lock-free reads/writes. Encoded as: 0 = None, 1-15 = ComponentName variants.
     focused_component: AtomicU8,
-    /// Latest authorization step reported by TDLib.
-    td_auth: Mutex<TdAuth>,
     /// Result of background photo decode; consumed by PhotoViewer on PhotoDecoded(i64).
     pending_photo_decoded: Mutex<Option<(i64, Result<image::DynamicImage, String>)>>,
 
@@ -148,7 +146,6 @@ impl AppContext {
             tg_context: Arc::new(tg_context),
             cli_args: Mutex::new(cli_args),
             focused_component: AtomicU8::new(0), // 0 = None
-            td_auth: Mutex::new(TdAuth::Starting),
             pending_photo_decoded: Mutex::new(None),
             #[cfg(feature = "rodio")]
             voice_playback_state: Mutex::new(crate::voice_playback::VoicePlaybackState::default()),
@@ -341,11 +338,6 @@ impl AppContext {
     /// The CLI arguments are a shared resource and are protected by a mutex.
     pub fn cli_args(&self) -> MutexGuard<'_, CliArgs> {
         self.cli_args.lock()
-    }
-
-    /// Get the latest TDLib authorization step.
-    pub fn td_auth(&self) -> MutexGuard<'_, TdAuth> {
-        self.td_auth.lock()
     }
 
     /// Encodes `Option<ComponentName>` to a `u8` for atomic storage.

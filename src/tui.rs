@@ -8,14 +8,13 @@ use crate::{
         status_bar::StatusBar, title_bar::TitleBar, SMALL_AREA_HEIGHT, SMALL_AREA_WIDTH,
     },
     event::Event,
-    tg::login_phase::TdAuth,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Main interface. Draws the sign-in card instead of the chat shell until
-/// TDLib reports [`TdAuth::Ready`], and routes events to the focused side.
+/// the session is authorized, and routes events to the focused side.
 pub struct Tui {
     app_context: Arc<AppContext>,
     components: HashMap<ComponentName, Box<dyn Component>>,
@@ -75,22 +74,28 @@ impl Tui {
             .handle_events(event)
     }
 
+    /// The sign-in card owns authorization state, so credentials move into it
+    /// without cloning; every other action fans out to the shell components.
     pub fn update(&mut self, action: Action) {
-        // The status bar also reads the area, so every component sees the action.
-        self.login.update(action.clone());
-        self.components
-            .values_mut()
-            .for_each(|component| component.update(action.clone()));
+        match action {
+            Action::Authorization(_) | Action::LoginFailed(_) => self.login.update(action),
+            action => self
+                .components
+                .values_mut()
+                .for_each(|component| component.update(action.clone())),
+        }
+    }
+
+    /// True once TDLib reports the session authorized; the shell replaces the card.
+    pub fn is_authorized(&self) -> bool {
+        self.login.is_authorized()
     }
 
     pub fn draw(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) -> Result<(), AppError<()>> {
-        if !matches!(*self.app_context.td_auth(), TdAuth::Ready) {
+        if !self.is_authorized() {
             self.login.draw(frame, area)?;
             return Ok(());
         }
-        // The card stops drawing from here on; sync to Ready through the
-        // regular update path so buffers and the QR cache are wiped.
-        self.login.update(Action::Refresh);
 
         self.component(&ComponentName::StatusBar)
             .update(Action::UpdateArea(area));
