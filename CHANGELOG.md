@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Added
 
+- In-terminal sign-in menu with phone-number and locally rendered QR-code login; rotating QR tokens update without blocking terminal input.
 - `static` feature to statically link `tdjson` (use with `download-tdlib` or `local-tdlib`); no runtime `tdjson` dependency needed. Powered by **tdlib-rs v1.4.0**.
 - CI: `static` feature combinations (`local-tdlib,static`, `download-tdlib,static`) in Linux, macOS, and Windows workflows.
 - CI: Android cross-compilation workflow (`aarch64-linux-android`, `x86_64-linux-android`) with static linking.
@@ -25,6 +26,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Changed
 
+- Simplified sign-in with a shared form renderer, direct QR-cell painting, and typed requests whose debug output redacts credentials.
+- Sign-in uses owned authorization updates, an explicit navigation mode, and the standard component event handler instead of polling shared state.
 - Upgraded **tdlib-rs** to v1.4.0 (new `static` feature, `ureq` replaces `reqwest`, Android support, `#[link]` attribute removed from tdjson FFI).
 - UI render-on-demand to reduce idle CPU while keeping Telegram-driven updates responsive.
 - Focus tracking uses atomics instead of a mutex for lock-free reads/writes.
@@ -34,6 +37,12 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Fixed
 
+- QR login keeps its scanner quiet zone when resized or displaying errors, avoids logging login links, and clears credentials when authorization finishes.
+- Sign-in preserves printable input without arbitrary length limits, rejects invalid pastes atomically, and validates phone syntax on submission instead of silently rewriting it.
+- Initial fullscreen clearing no longer queries the cursor while the terminal event reader is running.
+- Authorization and multi-key command handling release shared-context locks before asynchronous work.
+- Failed audio initialization disables playback instead of leaving a disconnected command sender.
+- Sign-in failures remain visible after queued authorization updates; quitting restores the previous terminal contents without clearing them afterward.
 - Stack overflow in the prompt when wrapping at the window edge (`insert_newline` no longer recurses through `insert('\n')`).
 - Occasional startup hangs and chat list refresh hangs.
 - Chat search reliability and clearer failure feedback via the status bar.

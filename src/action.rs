@@ -2,7 +2,10 @@ use {
     super::component_name::ComponentName,
     crate::{
         app_error::AppError,
-        tg::td_enums::{TdChatList, TdMessageReplyToMessage},
+        tg::{
+            login_phase::TdAuth,
+            td_enums::{TdChatList, TdMessageReplyToMessage},
+        },
     },
     crossterm::event::{KeyCode, KeyModifiers},
     ratatui::layout::Rect,
@@ -81,6 +84,33 @@ impl From<Modifiers> for KeyModifiers {
             key_modifiers.insert(KeyModifiers::META);
         }
         key_modifiers
+    }
+}
+
+/// Sign-in credential submitted from the login card.
+/// Carried by [`Action::Login`] and sent to TDLib on a background task.
+/// `Debug` redacts every payload so credentials never reach logs.
+#[derive(Clone, Eq, PartialEq)]
+pub enum LoginRequest {
+    /// Ask TDLib for a QR login link.
+    Qr,
+    /// Submit the phone number from the sign-in card.
+    Phone(String),
+    /// Submit the SMS or app login code.
+    Code(String),
+    /// Submit the cloud password (verbatim).
+    Password(String),
+    /// Submit an email address Telegram asked for.
+    Email(String),
+    /// Submit the email verification code.
+    EmailCode(String),
+    /// Submit first and last name for a new account.
+    Registration { first: String, last: String },
+}
+// Login secrets must not reach logs; mirror `TdAuth`'s redaction.
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoginRequest([redacted])")
     }
 }
 
@@ -323,6 +353,13 @@ pub enum Action {
     HideFileDownloadExplorer,
     /// Download/copy a Telegram file to `dest_path` (full path including file name).
     SaveChatFileAs { message_id: i64, dest_path: String },
+
+    /// Sign-in credential from the login card; submitted to TDLib in the background.
+    Login(LoginRequest),
+    /// A sign-in request was rejected. The card shows `message`.
+    LoginFailed(String),
+    /// Latest TDLib authorization step; routed only to the login card.
+    Authorization(TdAuth),
 }
 /// Implement the `Action` enum.
 impl Action {

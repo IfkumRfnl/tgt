@@ -12,6 +12,7 @@ pub mod component_traits;
 pub mod core_window;
 pub mod file_download_explorer;
 pub mod file_upload_explorer;
+pub mod login_window;
 pub mod photo_viewer;
 pub mod pinned_messages_popup;
 pub mod prompt_window;
